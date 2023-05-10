@@ -1,0 +1,309 @@
+# Amazon Connect Config Rules
+# By Sam Frederick <samfred@amazon.com>
+#
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+# 
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Config rules to check configuration settings on Amazon Connect instances
+Resources: 
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonKinesisReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseReadOnlyAccess
+
+  # Check various Amazon Connect instance storage config settings
+  CheckInstanceStorageConfigLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def evaluate_compliance(connect_instance, storage_config_type):
+              connect_client = boto3.client('connect')
+              kinesis_client = boto3.client('kinesis')
+
+              storage_configs = connect_client.list_instance_storage_configs(
+                  InstanceId=connect_instance,
+                  ResourceType=storage_config_type
+              )
+              
+              print("Found storage configs for", connect_instance, ":", storage_configs)
+              
+              for storage_config in storage_configs['StorageConfigs']:
+                  if ("S3Config" in storage_config and "EncryptionConfig" in storage_config["S3Config"]) or ("KinesisVideoStreamConfig" in storage_config and "EncryptionConfig" in storage_config["KinesisVideoStreamConfig"]):
+                      print("S3 encryption detected for", storage_config_type, ", returning COMPLIANT")
+                      return "COMPLIANT"
+                  elif "KinesisStreamConfig" in storage_config:
+                      stream_arn = storage_config['KinesisStreamConfig']['StreamArn']
+                      stream_config = kinesis_client.describe_stream(
+                          StreamARN=stream_arn    
+                      )
+                      
+                      if stream_config['StreamDescription']['EncryptionType'] == "KMS":
+                          print("Stream encryption detected for", storage_config_type, ", returning COMPLIANT")
+                          return "COMPLIANT"
+                      
+
+                  print("Encryption NOT detected for", storage_config_type, ", returning NON_COMPLIANT")
+                  return "NON_COMPLIANT"
+              
+              print("Storage config not found for", storage_config_type, ", returning NOT_APPLICABLE")
+              return "NOT_APPLICABLE"
+
+          def evaluate_all_connect_instances(event, storage_config_type):
+              connect_client = boto3.client('connect')
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              evaluations = []
+              print("Found Instances:", instances)
+              for instance in instances['InstanceSummaryList']:
+                  compliance_status = evaluate_compliance(instance["Id"], storage_config_type)
+                  evaluation = {
+                      'Annotation': f'Storage config {storage_config_type} is enabled and encrypted' if compliance_status == "COMPLIANT" else f'Storage config {storage_config_type} is missing or not encrypted',
+                      'ComplianceResourceType': 'AWS::Connect::Instance',
+                      'ComplianceResourceId': instance['Id'],
+                      'ComplianceType': compliance_status,
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                  }
+                  print ("Inserting evaluation:", evaluation)
+                  evaluations.append(evaluation)
+                  
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+              )
+              
+              return response
+              
+          def lambda_handler(event, context):
+              print("Received Config Event:", event)
+
+              storage_config_type = json.loads(event['ruleParameters'])['InstanceStorageType']
+              print("Evaluating", storage_config_type)
+
+              response = evaluate_all_connect_instances(event, storage_config_type)
+              return response
+
+      Timeout: 10
+  
+  CheckInstanceStorageConfigLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckInstanceStorageConfigLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  ConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - LambdaExecutionRole
+      - CheckInstanceStorageConfigLambdaFunction
+      - CheckInstanceStorageConfigLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-operational-best-practices
+      TemplateBody: !Sub 
+        - |
+          Resources:
+            # Check CALL_RECORDINGS
+            CallRecordingEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-call-recording-encryption
+                Description: Check call recording encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CALL_RECORDINGS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check CHAT_TRANSCRIPTS
+            ChatTranscriptsEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-chat-transcripts-encryption
+                Description: Check chat transcripts encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CHAT_TRANSCRIPTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check MEDIA_STREAMS
+            LiveMediaStreamingEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-live-media-streaming-encryption
+                Description: Check live media streaming encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "MEDIA_STREAMS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check SCHEDULED_REPORTS
+            ExportedReportsEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-exported-reports-encryption
+                Description: Check exported reports encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "SCHEDULED_REPORTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check ATTACHMENTS
+            AttachmentsEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-attachments-encryption
+                Description: Check attachments encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "ATTACHMENTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check CONTACT_EVALUATIONS
+            ContactEvaluationsEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-contact-evaluations-encryption
+                Description: Check contact evaluations encryption settings on Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CONTACT_EVALUATIONS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check CTR Kinesis Stream is encrypted
+            CTRKinesisStreamEncryptedRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-ensure-ctr-stream-encryption-enabled
+                Description: Checks that the CTR Kinesis Stream is encrypted on an Amazon Connect instance
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CONTACT_TRACE_RECORDS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check Agent Events Kinesis Stream is encrypted
+            AgentEventsKinesisStreamEncryptedRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-ensure-agent-events-stream-encryption-enabled
+                Description: Checks that the Agent Events Kinesis Stream is encrypted on an Amazon Connect instance
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "AGENT_EVENTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check Real Time Contact Analysis Segments Kinesis Stream is encrypted
+            RealTimeContactAnalysisKinesisStreamEncryptedRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-ensure-real-time-contact-analysis-stream-encryption-enabled
+                Description: Checks that the Real Time Contact Analysis Kinesis stream is encrpyed on an Amazon Connect instance
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "REAL_TIME_CONTACT_ANALYSIS_SEGMENTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+        - { Function: !GetAtt 'CheckInstanceStorageConfigLambdaFunction.Arn' }
+              
