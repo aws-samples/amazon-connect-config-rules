@@ -1,6 +1,8 @@
 # Amazon Connect Config Rules
 
-This project contains an example of an [AWS Config Conformance Pack](https://docs.aws.amazon.com/config/latest/developerguide/conformance-packs.html) with rules for [Amazon Connect](https://aws.amazon.com/connect/) contact center instances.
+The Amazon Connect Config Rules project contains an example of an [AWS Config Conformance Pack](https://docs.aws.amazon.com/config/latest/developerguide/conformance-packs.html) with rules for [Amazon Connect](https://aws.amazon.com/connect/) contact center instances.
+
+This repository was presented as a demo for BIZ302, "Meet your company’s security and compliance needs with Amazon Connect" at [AWS DC Summit 2023](https://aws.amazon.com/events/summits/washington-dc/). Contained at the bottom of this repository are links to resources on Amazon Connect compliance.
 
 **What is AWS Config?**
 
@@ -44,6 +46,12 @@ While this conformance pack is not designed to ensure compliance by itself, you 
 
 ## How can I contribute?
 If you have examples of AWS Config rules for Amazon Connect instances, feel free to open a PR with your suggestions and contributions!
+
+## Additional Resources
+* [Amazon Connect Docs: Best practices for PII compliance in Amazon Connect](https://docs.aws.amazon.com/connect/latest/adminguide/compliance-validation-best-practices-PII.html)
+* [Creating a Secure IVR solution with Amazon Connect blog](https://aws.amazon.com/blogs/contact-center/creating-a-secure-ivr-solution-with-amazon-connect/)
+* [Amazon Connect achieves FedRAMP High authorization](https://aws.amazon.com/blogs/publicsector/amazon-connect-achieves-fedramp-high-authorization/)
+* [AWS Services in Scope by Compliance Program page](https://aws.amazon.com/compliance/services-in-scope/)
 
 ## Security
 
