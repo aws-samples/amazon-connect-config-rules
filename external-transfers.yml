@@ -1,0 +1,173 @@
+# Amazon Connect Config Rules - External Transfers
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for the Lambda Function
+  CheckE164FormatLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonLexReadOnly
+  # Lambda Function
+  CheckE164FormatLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lexternal-transfer-format-check-lambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckE164FormatLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import re
+
+          connect_client = boto3.client('connect')
+
+          def is_valid_e164(number):
+              # E.164 format: +[country code][subscriber number including area code]
+              # Country code: 1 to 3 digits
+              # Subscriber number: Up to 15 digits
+              number=number.replace("-","")
+              pattern = r'^\+?\d{1,3}\d{5,15}$'
+              if re.match(pattern, number):
+                  digit_count = sum(c.isdigit() for c in number)
+                  if (number.startswith('+') and digit_count>=7 and digit_count<=15):
+                      return True
+                  else:
+                      country_code = number[:len(number) - 10]
+                      if 1 <= len(country_code) <= 3:
+                          return True
+              return False
+
+
+          def evaluate_compliance(connect_instance):
+              #Get All Contact Flows of Type CUSTOMER_QUEUE in an instance
+              #connect_instance="766bb67f-0190-494b-9a34-5f60e8f61c68"
+              flow_list = connect_client.list_contact_flows(
+              InstanceId=connect_instance,
+              ContactFlowTypes=['CONTACT_FLOW']
+              )
+              non_compliant_flow =[]
+              if not flow_list["ContactFlowSummaryList"]:
+                  return "NOT_APPLICABLE"
+              else:
+                  compliant_status=1
+                  for flow in flow_list["ContactFlowSummaryList"]:
+                      try:
+                          describe_flow = connect_client.describe_contact_flow(
+                              InstanceId=connect_instance,
+                              ContactFlowId=flow["Id"]
+                          )
+                      except:
+                          print("describe flow error")
+                      #Extract the Flow Metadata and convert it into JSON
+                      if(describe_flow):
+                          flow_content = json.loads(describe_flow["ContactFlow"]["Content"])
+                          for Action in flow_content["Actions"]:
+                              if(("Parameters" in Action) and ("ThirdPartyPhoneNumber" in Action["Parameters"])):
+                                  if(is_valid_e164(Action["Parameters"]["ThirdPartyPhoneNumber"])==False):
+                                      non_compliant_flow.append(describe_flow["ContactFlow"]["Name"])
+                          if(non_compliant_flow):
+                              compliant_status= 0
+              result={"compliance_status":compliant_status,"non_compliant_flow":non_compliant_flow}
+              return result
+
+          def evaluate_all_connect_instances(event):
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              evaluations = []
+              #test_stat=evaluate_compliance("766bb67f-0190-494b-9a34-5f60e8f61c68")
+              for instance in instances['InstanceSummaryList']:
+                  result = evaluate_compliance(instance["Id"])
+                  evaluation = {
+                      'Annotation': f'All the contact flows are Compliant' if result['compliance_status'] else f'Non compliant flows are'+str(result['non_compliant_flow']),
+                      'ComplianceResourceType': 'AWS::Connect::Instance',
+                      'ComplianceResourceId': instance['Id'],
+                      'ComplianceType': f'COMPLIANT' if result['compliance_status'] else f'NON_COMPLIANT',
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                  }
+                  evaluations.append(evaluation)
+              
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+              )
+              response="success"
+              return response
+
+          def lambda_handler(event, context):                
+              response = evaluate_all_connect_instances(event)
+              return response
+
+      Timeout: 400
+
+  CheckE164FormatLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckE164FormatLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack
+  CheckE164FormatConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckE164FormatLambdaExecutionRole
+      - CheckE164FormatLambdaFunction
+    Properties:
+      ConformancePackName: amazon-connect-check-e164-formate
+      TemplateBody: !Sub
+        - |
+          Resources:
+            E164CheckConfigRule:
+                Type: AWS::Config::ConfigRule
+                Properties:
+                  ConfigRuleName: e164-check-resource-policy
+                  Description: E164 check resource policy
+                  Source:
+                    Owner: CUSTOM_LAMBDA
+                    SourceDetails:
+                      - EventSource: aws.config
+                        MaximumExecutionFrequency: One_Hour
+                        MessageType: ScheduledNotification
+                    SourceIdentifier: ${Function}
+                  Scope:
+                    ComplianceResourceTypes:
+                      - AWS::Connect::Instance
+        - { Function: !GetAtt 'CheckE164FormatLambdaFunction.Arn' }

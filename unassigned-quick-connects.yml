@@ -1,0 +1,169 @@
+# Amazon Connect Config Rules - Unassigned Quick Connects
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckUnassignedQuickConnectsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Check if there are Quick Connects which are not added to any queue
+  CheckUnassignedQuickConnectsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckUnassignedQuickConnectsLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          connect_client = boto3.client('connect')
+
+          def evaluate_compliance(connect_instance):
+
+            #Get all the Quick Connects
+            quick_connects_list = connect_client.list_quick_connects(
+              InstanceId=connect_instance,
+              QuickConnectTypes=[
+                'USER','QUEUE','PHONE_NUMBER'
+              ]
+            )
+
+            if not quick_connects_list["QuickConnectSummaryList"]:
+              return "NOT_APPLICABLE"
+
+            #Extract only the list of Quick Connect Names
+            quick_connects_name_list = [x["Name"] for x in quick_connects_list["QuickConnectSummaryList"]]
+
+            #Get all Queues
+            queues_list = connect_client.list_queues(
+              InstanceId=connect_instance,
+              QueueTypes=['STANDARD']
+            )
+
+            queue_quick_connect_name_list = []
+
+            for queue in queues_list["QueueSummaryList"]:
+              queue_quick_connect_name = connect_client.list_queue_quick_connects(
+                InstanceId=connect_instance,
+                QueueId=queue["Id"]
+              )
+
+              for quick_connect_name in queue_quick_connect_name["QuickConnectSummaryList"]:
+                if quick_connect_name["Name"] not in queue_quick_connect_name_list:
+                  queue_quick_connect_name_list.append(quick_connect_name["Name"] )
+            
+            unassigned_quick_connect_list = list(set(quick_connects_name_list) - set(queue_quick_connect_name_list))
+
+            if(unassigned_quick_connect_list):
+              print("These quick connects in InstanceID "+ connect_instance + " is not assigned to any queues:"+str(unassigned_quick_connect_list))
+              return "NON_COMPLIANT"
+            else:
+              return "COMPLIANT"
+
+
+          def evaluate_all_connect_instances(event):
+            instances = connect_client.list_instances()
+            invoking_event = json.loads(event['invokingEvent'])
+
+            evaluations = []
+            print("Found Instances:", instances)
+            for instance in instances['InstanceSummaryList']:
+              compliance_status = evaluate_compliance(instance["Id"])
+              evaluation = {
+                'Annotation': f'No Unassigned Quick Connects' if compliance_status == "COMPLIANT" else (f'There are Unassigned Quick Connects' if compliance_status == "NON_COMPLIANT" else f'There are no Quick Connects in the instance'),
+                'ComplianceResourceType': 'AWS::Connect::Instance',
+                'ComplianceResourceId': instance['Id'],
+                'ComplianceType': compliance_status,
+                'OrderingTimestamp': invoking_event['notificationCreationTime']
+              }
+              print ("Inserting evaluation:", evaluation)
+              evaluations.append(evaluation)
+
+            config_client = boto3.client('config')
+            response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+            )
+
+            return response
+
+          def lambda_handler(event, context):
+            print("Received Config Event:", event)
+
+            response = evaluate_all_connect_instances(event)
+            return response
+
+      Timeout: 60
+
+  CheckUnassignedQuickConnectsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckUnassignedQuickConnectsLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckUnassignedQuickConnectsConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckUnassignedQuickConnectsLambdaExecutionRole
+      - CheckUnassignedQuickConnectsLambdaFunction
+      - CheckUnassignedQuickConnectsLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-unassigned-quick-connects-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check UNASSIGNED_QUICK_CONNECTS
+            CheckUnassignedQuickConnectsConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-unassigned-quick-connects-rule
+                Description: Check if there are Quick Connects which are not added to any queue
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckUnassignedQuickConnectsLambdaFunction.Arn' }

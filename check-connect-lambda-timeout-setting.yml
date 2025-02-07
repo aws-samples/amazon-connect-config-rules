@@ -1,0 +1,255 @@
+# Amazon Connect Config Rules
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckConnectLambdaTimeoutExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+      Policies:
+        - PolicyName: CheckConnectLambdaTimeoutPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:GetFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:ListFunctions'
+                Resource: '*'
+
+  CheckConnectLambdaTimeoutFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckConnectLambdaTimeoutExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import boto3
+
+          import json
+          import datetime
+
+          # SDK clients for making API calls
+          lambda_client = boto3.client('lambda')
+          connect_client = boto3.client('connect')
+          config_client = boto3.client('config')
+
+          def lambda_handler(event, context):
+              """
+              Check that the Lambda functions associated with Amazon Connect instances have at least the minimum timeout value.
+              """
+
+              print(f'Received AWS Config Event: {event}')
+
+              MAXIMUM_TIMEOUT_IN_SECONDS_FOR_COMPLIANCE = 8
+
+              print(f'Begin: Check that the Lambda functions associated with Amazon Connect instances have a timeout value of at maximum {MAXIMUM_TIMEOUT_IN_SECONDS_FOR_COMPLIANCE} seconds.')
+
+              # Get instances in this region
+              list_of_connect_instances = list_connect_instances()
+
+              list_of_non_compliant_functions = []
+
+              # For each Connect instance in this region,
+              # list the Lambda funtions that are associated with the instance, 
+              # get the duration and evaluate their compliance status
+              for connect_instance in list_of_connect_instances:
+                  connect_instance_arn = connect_instance.get('Arn')
+                  list_of_function_arns = list_functions_for_instance(connect_instance_arn)
+
+                  map_of_functions_and_durations = get_map_of_functions_and_durations(list_of_function_arns)
+                  
+                  list_of_non_compliant_functions.extend(evaluate_compliance_status_for_functions(map_of_functions_and_durations, event, MAXIMUM_TIMEOUT_IN_SECONDS_FOR_COMPLIANCE))
+
+              print(f'List of functions with timeout setting less than {MAXIMUM_TIMEOUT_IN_SECONDS_FOR_COMPLIANCE} seconds: {list_of_non_compliant_functions}')
+
+              print(f'Completed check.')
+              
+              return "Done"
+
+          def list_connect_instances():
+              """
+              Returns a list of Connect instance ARNs in this region.
+              """
+              response = connect_client.list_instances()
+              list_of_connect_instances = response.get('InstanceSummaryList')
+
+              # Continue checking for instances, as long as there is a next token
+              while response.get('NextToken'):
+                  next_token = response.get('NextToken')
+                  response = connect_client.list_instances(NextToken=next_token)
+                  list_of_connect_instances.extend(response.get('InstanceSummaryList'))
+
+              return list_of_connect_instances
+
+          def list_functions_for_instance(connect_instance_arn):
+              """
+              Returns a list of function ARNs associated with the given Connect instance.
+              """ 
+              response = connect_client.list_lambda_functions(InstanceId=connect_instance_arn)
+              list_of_function_arns = response.get('LambdaFunctions')
+
+              # Continue checking for functions, as long as there is a next token
+              while response.get('NextToken'):
+                  next_token = response.get('NextToken')
+                  response = connect_client.list_lambda_functions(InstanceId=connect_instance_arn, NextToken=next_token)
+                  list_of_function_arns.extend(response.get('LambdaFunctions'))
+              
+              return list_of_function_arns
+
+          def get_function_duration(function_arn):
+              """
+              Returns the duration of the Lambda function in seconds.
+              """
+              try:
+                  function_configuration = lambda_client.get_function_configuration(FunctionName=function_arn)
+              except Exception as error:
+                  print(f'Error when getting function configuration for {function_arn}: {error}')
+                  return None
+              
+              timeout_value = function_configuration.get('Timeout')
+
+              return timeout_value
+
+
+          def get_map_of_functions_and_durations(list_of_function_arns):
+              """
+              Returns a dictionary mapping each function ARN to its respective duration in seconds.
+              """
+              map_of_functions_and_durations = {}
+
+              for function_arn in list_of_function_arns:
+                  duration = get_function_duration(function_arn)
+                  map_of_functions_and_durations[function_arn] = duration
+
+              return map_of_functions_and_durations
+
+
+          def evaluate_compliance_status_for_functions(map_of_functions_and_durations, event, maximum_timeout_in_seconds):
+              """
+              Check if a function meets the compliance criteria, and set its compliance status accordingly.
+              """
+
+              # AWS Config invoking event is a JSON string, hence json.loads() to parse it
+              invoking_event = json.loads(event['invokingEvent'])
+              result_token = event['resultToken']
+
+              list_of_non_compliant_functions = []
+              compliance_status = ''
+
+              for function_arn, duration in map_of_functions_and_durations.items():
+                  if duration > maximum_timeout_in_seconds:
+                      list_of_non_compliant_functions.append(function_arn)
+                      compliance_status = 'NON_COMPLIANT'
+                  else:
+                      compliance_status = 'COMPLIANT'
+
+                  try:
+                      response = config_client.put_evaluations(
+                          Evaluations=[
+                              {
+                                  'Annotation': f'AWS Lambda function timeout setting is equal or less than {maximum_timeout_in_seconds} seconds.' if compliance_status == "COMPLIANT" else f'AWS Lambda function timeout setting is more than {maximum_timeout_in_seconds} seconds.',
+                                  'ComplianceResourceType': 'AWS::Lambda::Function',
+                                  'ComplianceResourceId': function_arn,
+                                  'ComplianceType': compliance_status,
+                                  'OrderingTimestamp': invoking_event['notificationCreationTime']
+                              },
+                          ],
+                          ResultToken=result_token,
+                      )
+                      
+                      if response['FailedEvaluations']:
+                          print(f'Failed evaluation for {function_arn}: {response["FailedEvaluations"]}')
+
+                  except Exception as error:
+                      print(f'Error when calling the PutEvaluations API action for {function_arn}: {error}')
+
+              return list_of_non_compliant_functions
+
+  CheckConnectLambdaTimeoutInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckConnectLambdaTimeoutFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckConnectLambdaTimeoutConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: amazon-connect-check-lambda-timeout-setting
+      Description: Check AWS Lambda timeout setting for functions linked to Amazon Connect instances
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt CheckConnectLambdaTimeoutFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MaximumExecutionFrequency: One_Hour
+            MessageType: ScheduledNotification
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::Connect::Instance
+          - AWS::Lambda::Function
+
+  CheckLambdaTimeoutConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckConnectLambdaTimeoutFunction
+    Properties:
+      ConformancePackName: amazon-connect-lambda-timeout-check
+      TemplateBody: !Sub
+        - |
+          Resources:
+            CheckConnectLambdaTimeoutConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-lambda-timeout-setting
+                Description: Check AWS Lambda timeout setting for functions linked to Amazon Connect instances
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: ${Function}
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+                    - AWS::Lambda::Function
+        - Function: !GetAtt CheckConnectLambdaTimeoutFunction.Arn

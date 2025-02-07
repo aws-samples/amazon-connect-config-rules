@@ -1,0 +1,191 @@
+# Amazon Connect Config Rules - s3 Access Policy Check
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for the Lambda Function
+  S3AccessPolicyCheckExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  # Lambda Function
+  S3AccessPolicyCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3-Access-Policy-Check
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt S3AccessPolicyCheckExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+
+
+
+          # SDK clients for making API calls
+          s3_client = boto3.client('s3')
+          connect_client = boto3.client('connect')
+          config_client = boto3.client('config')
+          def get_s3_bucket(connect_instance,storage_config_type):
+              storage_configs = connect_client.list_instance_storage_configs(
+                  InstanceId=connect_instance,
+                  ResourceType=storage_config_type
+              )
+
+              for storage_config in storage_configs['StorageConfigs']:
+                  bucket_name = storage_config["S3Config"]["BucketName"]
+                  return bucket_name
+
+              return None
+
+          def evaluate_compliance(bucket_name):
+
+              logging_status = s3_client.get_bucket_logging(Bucket=bucket_name)
+              if 'LoggingEnabled' in logging_status:
+                  return "COMPLIANT"
+              
+              return "NON_COMPLIANT"
+
+
+
+          def list_connect_instances():
+              # Returns a list of Connect instance ARNs in this region.
+              response = connect_client.list_instances()
+              instances = response.get('InstanceSummaryList')
+
+              # Continue checking for instances, as long as there is a next token
+              while 'NextToken' in response:
+                  response = connect_client.list_instances(NextToken=response['NextToken'])
+                  instances.extend(response.get('InstanceSummaryList'))
+
+              return instances
+
+
+
+          def evaluate_all_connect_instances(event):
+              instances = list_connect_instances()
+              # Defining the list of storageConfig types which can have S3 bucket configured
+              storage_config_types = ['CHAT_TRANSCRIPTS', 'CALL_RECORDINGS', 'SCHEDULED_REPORTS', 'ATTACHMENTS', 'CONTACT_EVALUATIONS', 'SCREEN_RECORDINGS']
+              compliance_status = ''
+
+              
+              #AWS Config invoking event is a JSON string, hence json.loads() to parse it
+              invoking_event = json.loads(event['invokingEvent'])
+              result_token = event['resultToken']
+              
+              for instance in instances:
+                  bucket_info={}
+                  evaluations = []
+                  for storage_config_type in storage_config_types:
+                      print("Evaluating", storage_config_type)
+                      bucket_name = get_s3_bucket(instance["Id"],storage_config_type)
+                      if bucket_name in bucket_info:
+                          bucket_info[bucket_name]['config-list'].append(storage_config_type)
+                      else:
+                          bucket_info[bucket_name] = {'config-list': [storage_config_type]}
+
+                      if 'status' in bucket_info[bucket_name] or bucket_name == None: 
+                          continue
+                      else:
+                          print("Evaluating",evaluate_compliance(bucket_name))
+                          bucket_info[bucket_name]['status'] = evaluate_compliance(bucket_name)
+
+                  print(bucket_info)
+                  for bucket_name,bucket_details in bucket_info.items():
+                      print(bucket_name,bucket_details.get('status'))
+                      if bucket_details.get('status') == None:
+                          continue
+                      evaluation = {
+                              'Annotation': f'Access Logging enabled for Instance Id - {instance["Id"]}, Storage config - {", ".join(map(str, bucket_details.get("config-list", [])))} for bucket - {bucket_name}' if bucket_details.get('status') == "COMPLIANT" else f'No Access Logging for Instance Id {instance["Id"]},  Storage config - {", ".join(map(str, bucket_details.get("config-list", [])))} for bucket - {bucket_name}',
+                              'ComplianceResourceType': 'AWS::S3::Bucket',
+                              'ComplianceResourceId': bucket_name,
+                              'ComplianceType': bucket_details.get('status'),
+                              'OrderingTimestamp': invoking_event['notificationCreationTime']
+                          }
+                      evaluations.append(evaluation)
+                  print("Evaluations:", evaluations) 
+                  
+                  response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+                  )
+                  print(response)
+
+
+
+              
+          def lambda_handler(event, context):
+              print(f'Received AWS Config Event: {event}')
+              evaluate_all_connect_instances(event)
+
+      Timeout: 900
+
+  S3AccessPolicyResourcePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt S3AccessPolicyCheckFunction.Arn
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack
+  S3AccessPolicyConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - S3AccessPolicyCheckExecutionRole
+      - S3AccessPolicyCheckFunction
+    Properties:
+      ConformancePackName: amazon-connect-s3-access-policy-check
+      TemplateBody: !Sub
+        - |
+          Resources:
+            S3AccessPolciyConfigRule:
+                Type: AWS::Config::ConfigRule
+                Properties:
+                  ConfigRuleName: amazon-connect-s3-access-policy-check
+                  Description: S3 Access Policy check
+                  Source:
+                    Owner: CUSTOM_LAMBDA
+                    SourceDetails:
+                      - EventSource: aws.config
+                        MaximumExecutionFrequency: One_Hour
+                        MessageType: ScheduledNotification
+                    SourceIdentifier: ${Function}
+                  Scope:
+                    ComplianceResourceTypes:
+                      - AWS::Connect::Instance
+        - { Function: !GetAtt 'S3AccessPolicyCheckFunction.Arn' }

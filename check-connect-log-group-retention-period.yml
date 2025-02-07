@@ -1,0 +1,196 @@
+# Amazon Connect Config Rules - Check Lambda Timeouts
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckConnectLogGroupRetentionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+      Policies:
+        - PolicyName: CheckConnectLogGroupRetentionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+
+  # Check various Amazon Connect instance log group retention period settings
+  CheckConnectLogGroupRetentionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckConnectLogGroupRetentionExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          # SDK clients for making API calls
+          logs_client = boto3.client('logs')
+          connect_client = boto3.client('connect')
+          config_client = boto3.client('config')
+
+          def lambda_handler(event, context):
+              """
+              Check that the CloudWatch log groups associated with Amazon Connect instances have the retention period set, and at least the minimum number of days.
+              """
+
+              print(f'Received AWS Config Event: {event}')
+
+              MINIMUM_RETENTION_IN_DAYS_FOR_COMPLIANCE = 120
+
+              print(f'Begin: Check that the CloudWatch log groups associated with Amazon Connect instances have a retention period of at least {MINIMUM_RETENTION_IN_DAYS_FOR_COMPLIANCE} days.')
+
+              list_of_log_groups = list_log_groups()
+
+              list_of_non_compliant_log_groups = evaluate_compliance_status_for_log_group_retention(list_of_log_groups, event, MINIMUM_RETENTION_IN_DAYS_FOR_COMPLIANCE)
+
+              print(f'List of log groups with a retention period less than {MINIMUM_RETENTION_IN_DAYS_FOR_COMPLIANCE} days: {list_of_non_compliant_log_groups}')
+
+              print(f'Completed check.')
+                        
+              return "Done"
+
+          def list_log_groups():
+              """
+              List all log groups for Amazon Connect instances in an AWS region
+              """
+              list_of_log_groups = []
+
+              response = logs_client.describe_log_groups(logGroupNamePrefix='/aws/connect')
+
+              list_of_log_groups.extend(response['logGroups'])
+
+              # Continue checking for log groups, as long as there is a Next token
+              while response.get('nextToken'):
+                  next_token = response.get('nextToken')
+                  response = logs_client.describe_log_groups(
+                      logGroupNamePrefix = '/aws/connect',
+                      nextToken = next_token
+                  )
+
+                  list_of_log_groups.extend(response['logGroups'])
+
+              return list_of_log_groups
+
+          def evaluate_compliance_status_for_log_group_retention(list_of_log_groups, event, minimum_retention_in_days):
+              """
+              Check if any log group's retention period is not set, or if it is less than MINIMUM_RETENTION_IN_DAYS (180 days).
+              """
+              # AWS Config invoking event is a JSON string, hence json.loads() to parse it
+              invoking_event = json.loads(event['invokingEvent'])
+              result_token = event['resultToken']
+
+              list_of_non_compliant_log_groups = []
+              compliance_status = ''
+
+              for log_group in list_of_log_groups:
+                  if log_group.get('retentionInDays') is None:
+                      # If retentionInDays is None, that means the log group has never been set with a retention period.
+                      # Hence, it is not compliant.
+                      compliance_status = 'NON_COMPLIANT'
+                  elif log_group.get('retentionInDays') < minimum_retention_in_days:
+                      list_of_non_compliant_log_groups.append(log_group)
+                      compliance_status = 'NON_COMPLIANT'
+                  else:
+                      compliance_status = 'COMPLIANT'
+
+                  try:
+                      response = config_client.put_evaluations(
+                          Evaluations=[
+                              {
+                                  'Annotation': f'Amazon CloudWatch log group retention in days is {minimum_retention_in_days} days.' if compliance_status == "COMPLIANT" else f'Amazon CloudWatch log group retention in days is less than {minimum_retention_in_days} days.',
+                                  'ComplianceResourceType': 'AWS::Logs::LogGroup',
+                                  'ComplianceResourceId': log_group.get('arn'),
+                                  'ComplianceType': compliance_status,
+                                  'OrderingTimestamp': invoking_event['notificationCreationTime']
+                              },
+                          ],
+                          ResultToken=result_token,
+                      )
+                      
+                      print(response)
+
+                      if response['FailedEvaluations']:
+                          print(f'Failed evaluation for {log_group.get('arn')}: {response["FailedEvaluations"]}')
+
+                  except Exception as error:
+                      print(f'Error when calling the PutEvaluations API action for {log_group.get('arn')}: {error}')
+
+              return list_of_non_compliant_log_groups
+
+  CheckConnectLogGroupRetentionInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckConnectLogGroupRetentionFunction.Arn
+      Principal: config.amazonaws.com
+
+  # Check Amazon Connect Log Group Retention setting
+
+  CheckHoursAndStaffingConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckConnectLogGroupRetentionExecutionRole
+      - CheckConnectLogGroupRetentionFunction
+    Properties:
+      ConformancePackName: amazon-connect-check-hours-of-operation-and-staffing
+      TemplateBody: !Sub
+        - |
+          Resources:
+            CheckConnectLogGroupRetentionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-check-log-group-retention-setting
+                Description: Check that the CloudWatch log groups associated with Amazon Connect instances have the retention period set, and at least the minimum number of days, in an AWS account.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: { 'CheckType': 'Connect_Log_Group_Retention_Setting' }
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+                    - AWS::Lambda::Function
+        - { Function: !GetAtt 'CheckConnectLogGroupRetentionFunction.Arn' }

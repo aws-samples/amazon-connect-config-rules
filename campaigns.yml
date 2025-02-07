@@ -1,0 +1,929 @@
+# Amazon Connect Config Rules - Campaigns
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances.  These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CampaignsCheckLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess'
+      Policies:
+        - PolicyName: Connect_Campaigns_Check_Lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'connect:SearchUsers'
+                  - 'connect:ListInstances'
+                  - 'connect:SearchRoutingProfiles'
+                  - 'connect:ListRoutingProfileQueues'
+                  - 'connect-campaigns:DescribeCampaign'
+                  - 'connect-campaigns:ListCampaigns'
+                  - 'connect-campaigns:GetCampaignState'
+                Resource: '*'
+  ConnectCampaignsCheckLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt ConnectCampaignsCheckLambda.Arn
+      Principal: config.amazonaws.com
+  ConnectCampaignsCheckLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CampaignsCheckLambdaRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import re
+
+          def check_connect_users_for_auto_accept(instance_id, routing_profile_id):
+
+              connect_client = boto3.client('connect')
+              #search for users based on attached routing profiles:
+              response = connect_client.search_users(
+                  MaxResults=100,
+                  InstanceId=instance_id,
+                  SearchCriteria={
+                      'StringCondition': {
+                          'FieldName': 'RoutingProfileId',
+                          'Value': routing_profile_id,
+                          'ComparisonType': 'EXACT'
+                      }
+                  },
+              )
+              print('response: ' + json.dumps(response))
+              users = response["Users"]
+              #looping through in case there's a NextToken value set:
+              while token := response.get('NextToken'):
+                  print("in the while loop")
+                  response = connect_client.search_users(
+                      MaxResults=100,
+                      NextToken = response["NextToken"],
+                      InstanceId=instance_id,
+                      SearchCriteria={
+                          'StringCondition': {
+                              'FieldName': 'RoutingProfileId',
+                              'Value': routing_profile_id,
+                              'ComparisonType': 'EXACT'
+                          }
+                      },
+                  )
+                  users.extend(response["Users"])
+                  
+              #print("full user list")
+              print(json.dumps(users))
+              
+              #counting how many users attached to the routing profile have auto accept enabled vs not enabled:
+              test_results = {}
+              test_results["disabled"] = 0
+              test_results["enabled"] = 0
+              
+              for user in users:
+                  auto_accept_setting = user["PhoneConfig"]["AutoAccept"]
+                  if auto_accept_setting == False:
+                      test_results["disabled"] += 1
+                  else:
+                      test_results["enabled"] +=1
+              if test_results["disabled"] > 0:
+                  test_results["result"] = "NON_COMPLIANT"
+              else:
+                  test_results["result"] = "COMPLIANT"
+              
+              print(json.dumps(test_results))
+              return test_results
+
+          def evaluate_compliance(connect_instance, campaign, rp_queues_to_parse, check_type, test_type):
+              
+              # is the campaign running?
+              if (check_type == "campaigns_state"):
+                try:
+                  test_results = {}
+                  connect_campaigns_client = boto3.client('connectcampaigns')
+                  print("campaign id: ", campaign)
+                  campaign_state = connect_campaigns_client.get_campaign_state(
+                    id=campaign
+                  )
+                  print("campaign_state: ", campaign_state)
+                  print("current state value: ", campaign_state['state'] )
+                  
+                  if (campaign_state['state'] == "Running"):
+                    test_results["result"] = "COMPLIANT"
+                    test_results["state"] = campaign_state['state']
+                    print("campaign_state is Running")
+                    return test_results
+                  else:
+                    test_results["result"] = "NON_COMPLIANT"
+                    print("campaign_state is " + campaign_state['state'])
+                    test_results["state"] = campaign_state['state']
+                    return test_results
+                except Exception as e:
+                  print("error, printing result below")
+                  print(e)
+                  print("campaign_state is error")
+                  test_results["state"] = "error"
+                  test_results["result"] = "NON_COMPLIANT"
+                  return test_results
+              elif (check_type == "campaigns_queue_check"):
+                try:
+                  
+                  connect_campaigns_client = boto3.client('connectcampaigns')
+                  print("campaign id: ", campaign)
+                  campaign_description = connect_campaigns_client.describe_campaign(
+                    id=campaign
+                  )
+                  print("campaign_description: ", campaign_description)
+                  campaign_queue = campaign_description["campaign"]["outboundCallConfig"]["connectQueueId"]
+                  print("campaign_queue id: ", campaign_queue )
+                  #1a. Is the queue specified in the Campaign actually attached to a routing profile?
+                  test_results = {}
+                  test_results["result"] = "COMPLIANT"
+                  matched_rp_list = []
+                  #find all the routing profiles attached to the queue
+                  for rp in rp_queues_to_parse:
+                      match = re.search(campaign_queue, str(rp))
+                      if match:
+                          print('matched: ' + str(match))
+                          matched_rp_list.append(rp)
+                      else:
+                          print('not matched')
+                          
+                  print('matched_rp_list for ' + campaign_queue + ' includes: ' +  str(matched_rp_list))
+
+                  #1b. How many routing profiles have this queue attached?
+                  if test_type == "rp_count":
+                    if matched_rp_list == []:
+                      print('matched_rp_list == []')
+                      test_results["rp_count"] = "0"
+                      test_results["result"] = "NON_COMPLIANT"
+                      print(test_results["rp_count"])
+                    else:
+                      print("matched_rp_list " + str(matched_rp_list))
+                      test_results["rp_count"] = len(matched_rp_list)
+                      print(test_results["rp_count"])
+                    #add a return for this.  end of question
+                    test_results["state"] = test_results["rp_count"]
+                    return test_results
+                
+                  #2. how many agents are attached to the RPs?        
+                  elif test_type == "total_users":
+                    total_user_count = 0
+                    for rp in matched_rp_list:
+                      current_user_count = rp["rp_details"]["NumberOfAssociatedUsers"]
+                      total_user_count += current_user_count
+                      print("total user count is " + str(total_user_count))
+                    test_results["total_campaign_users"] = total_user_count
+                    test_results["state"] = total_user_count
+                    return test_results
+
+                  #3. Do all users attached to the routing profiles have auto answer enabled
+                  elif test_type == "auto_accept":
+                    for rp in matched_rp_list:
+                      user_auto_accept_check_result = check_connect_users_for_auto_accept(connect_instance, rp["rp_id"])
+                      print(json.dumps(user_auto_accept_check_result))
+                      test_results["user_auto_accept"] = {rp["rp_id"]: user_auto_accept_check_result}
+                      if user_auto_accept_check_result["result"] == "NON_COMPLIANT":
+                          test_results["result"] = user_auto_accept_check_result["result"]
+                    test_results["state"] = user_auto_accept_check_result
+                    return test_results
+
+                  #4. per routing profile, ensure only voice is selected for the outbound campaign queue
+                  elif test_type== "non_voice_queue_setting":
+                    rp_queue_non_voice_list = []
+                    for rp in matched_rp_list:
+                      for rp_queue in rp["rp_queue_list"]:
+                        if rp_queue["QueueId"] == campaign_queue and rp_queue["Channel"] != "VOICE":
+                          print('rp_queue: ' + json.dumps(rp_queue))
+                          print('rp_queue_non_voice: ' + rp_queue["QueueId"])
+                          rp_queue_non_voice_list.append(rp_queue["QueueId"])
+                          test_results["result"] = "NON_COMPLIANT"
+                          print('rp_queue_non_voice_list: ' + str(rp_queue_non_voice_list))
+                    test_results["rp_queue_non_voice"] = rp_queue_non_voice_list
+                    test_results["state"] = rp_queue_non_voice_list
+                    return test_results
+                      
+                except Exception as e:
+                  test_results["result"] = "NON_COMPLIANT"
+                  print("error, printing result below")
+                  print(e)
+                  print("campaign_state is error")
+                  return test_results
+
+          def get_campaign_list(instance):
+            connect_campaigns_client = boto3.client('connectcampaigns')
+            campaign_list = connect_campaigns_client.list_campaigns(
+                filters={
+                  'instanceIdFilter': {
+                      'value': instance,
+                      'operator': 'Eq'
+                  }
+              })
+            return(campaign_list)
+            
+          def get_all_routing_profiles_and_queues(instance_id):
+              connect_client = boto3.client('connect')
+              rp_search = connect_client.search_routing_profiles(
+                  InstanceId=instance_id
+                  )
+              print('rp_search output: ' + str(rp_search))
+              full_rp_queue_details = []
+              rp_list = rp_search["RoutingProfiles"]
+              for profile in rp_list:
+                  rp_queues = connect_client.list_routing_profile_queues(
+                      InstanceId=instance_id,
+                      RoutingProfileId=profile["RoutingProfileId"]
+                  )
+                  print('rp_queues ' + str(rp_queues))
+                  rp_id_and_queue_details = { 'rp_id': profile["RoutingProfileId"], 'rp_details': profile, 'rp_queue_list': rp_queues["RoutingProfileQueueConfigSummaryList"] }
+                  print('rp_id_and_queue_details: ' + str(rp_id_and_queue_details))
+                  full_rp_queue_details.append(rp_id_and_queue_details)
+              # all this stuff combined will get thrown into the function to get status by campaign
+              print('full_rp_queue_details' + str(full_rp_queue_details))
+              return full_rp_queue_details
+              
+
+          def evaluate_all_connect_instances(event):
+              connect_client = boto3.client('connect')
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              rule_params = json.loads(event['ruleParameters'])
+              check_type = rule_params["check_type"]
+              test_type = rule_params["test_type"]
+              
+              evaluations = []
+              print("Found Instances:", instances)
+              for instance in instances['InstanceSummaryList']:
+                  #collect all the routing profiles, queues, and list campaigns.  All this data will be used in the evaluate_compliance function.  
+                  rp_queues_to_parse = get_all_routing_profiles_and_queues(instance["Id"])
+                  campaigns_detail = get_campaign_list(instance["Id"])
+                  for campaign in campaigns_detail['campaignSummaryList']:
+                    #add call to describe campaign here and add output from it to evaluate_compliance call below
+                    compliance_status = evaluate_compliance(instance["Id"], campaign['id'], rp_queues_to_parse, check_type, test_type)
+                    print("compliance_status: ")
+                    print(json.dumps(compliance_status))
+                    result = compliance_status["result"]
+                    evaluation = {
+                      #'Annotation': f'{check_type} succeeded' if compliance_status["result"] == "COMPLIANT" else f'{check_type} failed',
+                      'Annotation': str(compliance_status["state"]),
+                      'ComplianceResourceType': 'AWS::Connect::ContactFlow',
+                      'ComplianceResourceId': campaign['id'],
+                      'ComplianceType': compliance_status["result"],
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                    }
+
+                    print ("Inserting evaluation:", evaluation)
+                    evaluations.append(evaluation)
+              # Write all results to AWS Config: 
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+              )
+              return response
+              
+          def lambda_handler(event, context):
+              print("Received Config Event:", event)
+              eval_results = evaluate_all_connect_instances(event)
+
+              response = "done"
+              return response
+      Timeout: 10
+
+  FlowLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole'
+      Policies:
+        - PolicyName: Connect_Campaigns_Config_Flow_Checker
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'connect:DescribeContactFlow'
+                  - 'connect:ListInstances'
+                  - 'connect-campaigns:DescribeCampaign'
+                  - 'connect-campaigns:ListCampaigns'
+                  - 'connect-campaigns:GetCampaignState'
+                  - 'connect-campaigns:GetCampaignStateBatch'
+                  - 'connect-campaigns:GetConnectInstanceConfig'
+                Resource: '*'
+  CheckConnectOutboundFlowConfigLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt FlowLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def evaluate_compliance(connect_instance, campaign, check_type, test_type):
+
+              if (check_type == "flow_checks"):
+                try:
+                  connect_campaigns_client = boto3.client('connectcampaigns')
+                  print("campaign id: ", campaign)
+                  campaign_state = connect_campaigns_client.describe_campaign(
+                    id=campaign
+                  )
+                  print("campaign_state: ", campaign_state)
+                  campaign_flow_id = campaign_state["campaign"]["outboundCallConfig"]["connectContactFlowId"]
+                  print("campaign_flow id: ", campaign_flow_id )
+                  amd_setting = campaign_state["campaign"]["outboundCallConfig"]["answerMachineDetectionConfig"]["enableAnswerMachineDetection"]
+                  connect_client = boto3.client('connect')
+                  
+                  campaign_flow_details = connect_client.describe_contact_flow(
+                    InstanceId=connect_instance,
+                    ContactFlowId=campaign_flow_id
+                  )
+                  
+                  print("flow details")
+                  print(campaign_flow_details)
+                  flow_string = str(campaign_flow_details)
+                  annotation = {}
+                  #:
+                  if test_type == "update_contact_attributes":
+                    if "UpdateContactAttributes" in flow_string:
+                      update_attributes_count = flow_string.count("UpdateContactAttributes")
+                      attributes_response = str(update_attributes_count) + " Update Contact Attributes block(s) in flow."
+                      annotation["detail"] = attributes_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                  elif test_type == "invoke_lambda_function":
+                    if "InvokeLambdaFunction" in flow_string:
+                      lambda_count = flow_string.count("InvokeLambdaFunction")
+                      lambda_response = str(lambda_count) + " Lambda block(s) in flow."
+                      annotation["detail"] = lambda_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                  elif test_type == "message_participant":
+                    if "MessageParticipant" in flow_string:
+                      play_prompt_count = flow_string.count("MessageParticipant")
+                      play_prompt_response = str(play_prompt_count) + " Play Prompt block(s) in flow."
+                      annotation["detail"] = play_prompt_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                  elif test_type == "update_contact_event_hooks":
+                    if "UpdateContactEventHooks" in flow_string:
+                      set_flow_count = flow_string.count("UpdateContactEventHooks")
+                      set_flow_response = str(set_flow_count) + " Set flow block(s) in flow."
+                      annotation["detail"] = set_flow_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                  elif test_type == "check_outbound_call_status":
+                    if "CheckOutboundCallStatus" in flow_string and amd_setting == False:
+                      amd_response = "AMD Block in flow but AMD not enabled on Campaign"
+                      annotation["detail"] = amd_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                    if "CheckOutboundCallStatus" not in flow_string and amd_setting == True:
+                      amd_response = "AMD block not in flow but AMD is enabled on Campaign"
+                      annotation["detail"] = amd_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                  elif test_type == "update_contact_target_queue":
+                    if "UpdateContactTargetQueue" in flow_string:
+                      set_queue_count = flow_string.count("UpdateContactTargetQueue")
+                      set_queue_response = str(set_queue_count) + " Set flow block(s) in flow."
+                      annotation["detail"] = set_queue_response
+                      annotation["response_message"] = "NON_COMPLIANT"
+                
+                  if "response_message" not in annotation:
+                    annotation["response_message"] = "COMPLIANT"
+                    annotation["detail"] = "COMPLIANT"
+                  
+                  print("flow_checks complete")
+                  
+                  print("annotation value:")
+                  print(annotation)
+                  return annotation
+
+                except Exception as e:
+                  annotation = {}
+                  print("error, printing result below")
+                  print(e)
+                  print("flow_checks is error")
+                  annotation["detail"] = "something has gone wrong."
+                  annotation["response_message"] = "NON_COMPLIANT"
+                  return annotation
+
+          def get_campaign_list(instance):
+            connect_campaigns_client = boto3.client('connectcampaigns')
+            campaign_list = connect_campaigns_client.list_campaigns(
+                filters={
+                  'instanceIdFilter': {
+                      'value': instance,
+                      'operator': 'Eq'
+                  }
+              })
+            return(campaign_list)
+
+          def evaluate_all_connect_instances(event):
+              connect_client = boto3.client('connect')
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              rule_params = json.loads(event['ruleParameters'])
+              check_type = rule_params["check_type"]
+              test_type = rule_params["test_type"]
+              
+              evaluations = []
+              print("Found Instances:", instances)
+              for instance in instances['InstanceSummaryList']:
+                try:
+                  connect_campaigns_client = boto3.client('connectcampaigns')
+
+                  outbound_campaigns_check = connect_campaigns_client.get_connect_instance_config(
+                    connectInstanceId=instance["Id"]
+                  )
+                  print("outbound_campaigns_check output: ", outbound_campaigns_check)
+                  print("outbound_campaigns_enabled is true")
+                  campaigns_detail = get_campaign_list(instance["Id"])
+                  print("campaigns_detail: " + json.dumps(campaigns_detail))
+                  if(len(campaigns_detail['campaignSummaryList']) > 0):
+                    for campaign in campaigns_detail['campaignSummaryList']:
+                      compliance_status = evaluate_compliance(instance["Id"], campaign['id'], check_type, test_type)
+                      response_message = compliance_status['response_message']
+                      result_detail = compliance_status['detail']
+                      evaluation = {
+                        'Annotation': result_detail,
+                        'ComplianceResourceType': 'AWS::Connect::ContactFlow',
+                        'ComplianceResourceId': campaign['id'],
+                        'ComplianceType': response_message,
+                        'OrderingTimestamp': invoking_event['notificationCreationTime']
+                      }
+            
+                      print ("Inserting evaluation:", evaluation)
+                      evaluations.append(evaluation)
+                  else:
+                    print("no campaigns defined in this instance")
+                except Exception as e:
+                  print("error path, expected if the instance isn't onboarded. printing error below to be sure")
+                  print(e)
+                  print("outbound_campaigns_enabled is false for this instance")
+
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+              )
+              return response
+              
+          def lambda_handler(event, context):
+              print("Received Config Event:", event)
+              eval_results = evaluate_all_connect_instances(event)
+
+              response = "done"
+              return response
+
+      Timeout: 10
+
+  CheckConnectOutboundFlowLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt CheckConnectOutboundFlowConfigLambda.Arn
+      Principal: config.amazonaws.com
+  LambdaExecutionRole1:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess'
+        - 'arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole'
+      Policies:
+        - PolicyName: Connect_Campaigns_Config_Checker
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'connect-campaigns:DescribeCampaign'
+                  - 'connect-campaigns:ListCampaigns'
+                  - 'connect-campaigns:GetCampaignState'
+                  - 'connect-campaigns:GetCampaignStateBatch'
+                  - 'connect-campaigns:GetConnectInstanceConfig'
+                Resource: '*'
+  CheckConnectConfigLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole1.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          from datetime import datetime
+          from datetime import timezone
+
+          def evaluate_compliance(connect_instance, check_type):
+              connect_client = boto3.client('connect')
+              if (check_type == "outbound_enabled"):
+                  instance_description = connect_client.describe_instance(
+                      InstanceId=connect_instance
+                  )
+                  outbound_calls_enabled = instance_description["Instance"]["OutboundCallsEnabled"]
+                  if (outbound_calls_enabled == True):
+                      print("outbound_calls_enabled is true")
+                      return "COMPLIANT"
+                  else:
+                      print("outbound_calls_enabled is false")
+                      return "NON_COMPLIANT"
+              elif (check_type == "outbound_instance_created_date"):
+                  instance_description = connect_client.describe_instance(
+                    InstanceId=connect_instance
+                  )
+                  instance_created_date = instance_description["Instance"]["CreatedTime"]
+                  date_check = datetime(2022, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+                  if (instance_created_date > date_check):
+                      print("instance created after 5/1/2022")
+                      return "COMPLIANT"
+                  else:
+                      print("instance created before 5/1/2022")
+                      return "NON_COMPLIANT"
+              elif (check_type == "campaigns_enabled"):
+                try:
+                  connect_campaigns_client = boto3.client('connectcampaigns')
+
+                  outbound_campaigns_check = connect_campaigns_client.get_connect_instance_config(
+                    connectInstanceId=connect_instance
+                  )
+                  print("outbound_campaigns_check output: ", outbound_campaigns_check)
+                  print("outbound_campaigns_enabled is true")
+                  return "COMPLIANT"
+                except Exception as e:
+                  print("error path, expected if the instance isn't onboarded. printing error below to be sure")
+                  print(e)
+                  print("outbound_campaigns_enabled is false")
+                  return "NON_COMPLIANT"
+                  
+          def evaluate_all_connect_instances(event):
+              connect_client = boto3.client('connect')
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              rule_params = json.loads(event['ruleParameters'])
+              check_type = rule_params["check_type"]
+              
+              evaluations = []
+              print("Found Instances:", instances)
+              for instance in instances['InstanceSummaryList']:
+                  compliance_status = evaluate_compliance(instance["Id"], check_type)
+                  evaluation = {
+                      'Annotation': f'{check_type} succeeded' if compliance_status == "COMPLIANT" else f'{check_type} failed',
+                      'ComplianceResourceType': 'AWS::Connect::Instance',
+                      'ComplianceResourceId': instance['Id'],
+                      'ComplianceType': compliance_status,
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                  }
+                  print ("Inserting evaluation:", evaluation)
+                  evaluations.append(evaluation)
+
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+              )
+              
+              return response
+              
+          def lambda_handler(event, context):
+              print("Received Config Event:", event)
+              eval_results = evaluate_all_connect_instances(event)
+
+              response = "done"
+              return response
+
+      Timeout: 10
+
+  CheckConnectConfigLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt CheckConnectConfigLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  ConfigConformancePack1:
+    Type: 'AWS::Config::ConformancePack'
+    DependsOn:
+      - LambdaExecutionRole1
+      - CheckConnectConfigLambdaFunction
+      - CheckConnectConfigLambdaPermission
+      - CheckConnectOutboundFlowConfigLambda
+      - FlowLambdaExecutionRole
+      - CheckConnectOutboundFlowLambdaPermission
+      - CampaignsCheckLambdaRole
+      - ConnectCampaignsCheckLambdaPermission
+      - ConnectCampaignsCheckLambda
+
+    Properties:
+      ConformancePackName: amazon-connect-outbound-best-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            #Check outbound calling enabled
+            OutboundCallsEnabledConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: instance-check-outbound-calls-enabled
+                Description: Check to see if outbound calling is enabled in Amazon Connect. Return compliant if outbound calling is enabled.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"check_type": "outbound_enabled"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            #Check instance creation date
+            InstanceCreationDateConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: instance-check-creation-date
+                Description: Check Amazon Connenct instance creation date.  Return compliant if instance created after 5/1/2022.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"check_type": "outbound_instance_created_date"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            # Check campaigns_enabled
+            OutboundCampaignsEnabledConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: instance-check-outbound-campaigns-enabled
+                Description: Check to see if outbound campaigns are enabled in Amazon Connect by instance. Return compliant if outbound campaigns are enabled.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"check_type": "campaigns_enabled"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+            #Check Flows for UpdateContactAttributes
+            FlowUpdateContactAttributes:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-update-contact-attributes
+                Description: Check outbound campaigns flows for Update Contact Attributes blocks. Return compliant if there are none.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "update_contact_attributes"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+            
+            #Check Flows for InvokeLambdaFunction
+            FlowInvokeLambdaFunction:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-invoke-lambda-function
+                Description: Check outbound campaigns flows for Invoke Lambda function blocks. Return compliant if there are none.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "invoke_lambda_function"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+
+            #Check Flows for MessageParticipant
+            FlowMessageParticipant:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-play-prompt
+                Description: Check outbound campaigns flows for play prompt blocks. Return compliant if there are none.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "message_participant"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+
+            #Check Flows for UpdateContactEventHooks
+            FlowUpdateContactEventHooks:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-set-flow
+                Description: Check outbound campaigns flows for set flow blocks. Return compliant if there are none.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "update_contact_event_hooks"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+
+            #Check Flows for CheckOutboundCallStatus
+            FlowCheckOutboundCallStatus:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-check-outbound-call-status
+                Description: Check outbound campaigns flows for Answering Machine Detection block and compares it with campaign status.  Returns compliant if matching. 
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "check_outbound_call_status"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+            
+            #Check Flows for UpdateContactTargetQueue
+            FlowCheckUpdateContactTargetQueue:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: flows-check-set-queue
+                Description: Check outbound campaigns flows for set queue blocks.  Returns compliant if none.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function2}
+                InputParameters: {"check_type": "flow_checks", "test_type": "update_target_contact_queue"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+
+            #Are the campaigns running?
+            OutboundCampaignsStateConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: campaigns-state
+                Description: Check outbound campaigns status.  Return complaint if status is RUNNING.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function3}
+                InputParameters: {"check_type": "campaigns_state", "test_type": "campaigns_state"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+            
+            #Do one or more routing profiles have the queue from the campaign attached?
+            OutboundCampaignsQueueRPCount:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: campaigns-queue-routingprofile-count
+                Description: Sum of routing profiles attached to the queue.  Return complaint if 1 or more.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function3}
+                InputParameters: {"check_type": "campaigns_queue_check", "test_type": "rp_count"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+            
+            #Are there any agents assigned to the Routing Profiles that include the queue attached to the campaign?
+            OutboundCampaignsUserCount:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: campaigns-user-count
+                Description: Sum of users assigned to routing profiles including the queue attached to the campaign.  Return complaint if 1 or more.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function3}
+                InputParameters: {"check_type": "campaigns_queue_check", "test_type": "total_users"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+
+            #Are all users assigned to routing profiles including the queue attached to the campaign set to auto answer calls?
+            OutboundCampaignsUsersAutoAccept:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: campaigns-users-auto-accept
+                Description: Are all users attached to the campaign set to auto accept calls? Return complaint if all users are set to auto accept.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function3}
+                InputParameters: {"check_type": "campaigns_queue_check", "test_type": "auto_accept"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+            
+            #Per routing profile, ensure only the voice channel is selected for outbound campaign queue.
+            OutboundCampaignsRPQueueNonVoiceEnabled:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: campaigns-queue-rp-non-voice-enabled
+                Description: Return compliant if voice is the only channel selected for the outbound campaign queue in related routing profiles.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function3}
+                InputParameters: {"check_type": "campaigns_queue_check", "test_type": "non_voice_queue_setting"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::ContactFlow
+        - Function: !GetAtt CheckConnectConfigLambdaFunction.Arn
+          Function2: !GetAtt CheckConnectOutboundFlowConfigLambda.Arn
+          Function3: !GetAtt ConnectCampaignsCheckLambda.Arn

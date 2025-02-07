@@ -1,0 +1,268 @@
+# Amazon Connect Config Rules - Lex V2 Resource Policies
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for the Lambda Function
+  LexV2LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonLexReadOnly
+  # Lambda Function
+  LexV2LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lex-v2-resource-policy-check-lambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt LexV2LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              """
+              AWS Lambda function that checks the Amazon Lex bot permissions for Amazon Connect instances.
+              """
+              config_client = boto3.client('config')
+              connect_client = boto3.client('connect')
+              lex_client = boto3.client('lexv2-models')
+
+              try:
+                  # Get the list of Amazon Connect instances
+                  connect_instances = list_connect_instances()
+
+                  for instance in connect_instances:
+                      connect_instance_arn = instance['Arn']
+
+                      # Get the list of associated Lex bots
+                      lex_bots = get_associated_lex_bots(connect_instance_arn, lex_client)
+                      non_compliant_bots_list=[]
+                      compliance_status=True
+                      for bot in lex_bots:
+                          lex_bot_alias_arn = bot['lex_bot_alias_arn']
+                          has_necessary_permissions = bot['has_necessary_permissions']
+                          if(has_necessary_permissions==False):
+                              non_compliant_bots_list.append(lex_bot_alias_arn)
+                              compliance_status=False
+                          # Put the evaluation result to AWS Config
+                          put_config_evaluation(
+                              config_client,
+                              non_compliant_bots_list,
+                              compliance_status,
+                              event,
+                              connect_instance_arn
+                          )
+
+                  return {
+                      'statusCode': 200,
+                      'body': 'Lex bot permissions checked and evaluation results put to AWS Config.'
+                  }
+
+              except Exception as e:
+                  print(f"Error: {e}")
+                  raise e
+
+          def get_associated_lex_bots(connect_instance_arn, lex_client):
+              """
+              Retrieves the list of Amazon Lex bots associated with the specified Amazon Connect instance.
+              
+              Args:
+                  connect_instance_arn (str): The ARN of the Amazon Connect instance.
+                  lex_client (boto3.client): The Ex client.
+              
+              Returns:
+                  list: A list of dictionaries, where each dictionary contains the Lex bot alias ARN and a boolean indicating if the bot has the necessary permissions.
+              """
+              print("get_associated_lex_bots")
+              lex_bots = []
+              connect_client = boto3.client('connect')
+              try:
+                  # List the Lex bots associated with the Connect instance
+                  print("before resp")
+                  response = connect_client.list_bots(
+                      InstanceId=connect_instance_arn.split(':')[-1].split('/')[-1],
+                      LexVersion='V2'
+                  )
+                  print("after resp")
+                  for bot in response['LexBots']:
+                      bot_info = {
+                          "lex_bot_alias_arn": bot['LexV2Bot']['AliasArn'],
+                          "has_necessary_permissions": check_lex_bot_permissions(bot['LexV2Bot']['AliasArn'], connect_instance_arn, lex_client)
+                      }
+                      lex_bots.append(bot_info)
+                  print("list of lex bots",lex_bots)
+                  return lex_bots
+              
+              except Exception as e:
+                  print(f"Error retrieving Lex bots: {e}")
+                  return []
+
+          def list_connect_instances():
+              """
+              Returns a list of Connect instance ARNs in this region.
+              """
+              connect_client = boto3.client('connect')
+              response = connect_client.list_instances()
+              list_of_connect_instances = response.get('InstanceSummaryList')
+
+              # Continue checking for instances, as long as there is a next token
+              while response.get('NextToken'):
+                  next_token = response.get('NextToken')
+                  response = connect_client.list_instances(NextToken=next_token)
+                  list_of_connect_instances.extend(response.get('InstanceSummaryList'))
+              print("list of connect instances", list_of_connect_instances)
+              return list_of_connect_instances
+              
+              
+          def check_lex_bot_permissions(lex_bot_alias_arn, connect_instance_arn, lex_client):
+              """
+              Checks if the specified Amazon Lex bot has the necessary permissions for the given Amazon Connect instance.
+              
+              Args:
+                  lex_bot_alias_arn (str): The ARN of the Amazon Lex bot alias.
+                  connect_instance_arn (str): The ARN of the Amazon Connect instance.
+                  lex_client (boto3.client): The Lex client.
+              
+              Returns:
+                  bool: True if the Lex bot has the necessary permissions, False otherwise.
+              """
+              print(lex_bot_alias_arn)
+              print(connect_instance_arn)
+              lex_client = boto3.client('lexv2-models')
+              try:
+                  
+                  # Check if the bot has a resource policy
+                  response = lex_client.describe_resource_policy(
+                      resourceArn=lex_bot_alias_arn
+                  )
+                  resource_policy=json.loads(response['policy'])
+                  print("resource policy", resource_policy['Version'])
+                  has_recognize_text = False
+                  has_start_conversation = False
+                  for statement in resource_policy['Statement']:
+                      print("in for")
+                      if 'Effect' in statement and statement['Effect'] == 'Allow' and 'Action' in statement:
+                          print("in if1")
+                          if 'lex:RecognizeText' in statement['Action']:
+                              print("in if2")
+                              has_recognize_text = True
+                          if 'lex:StartConversation' in statement['Action']:
+                              print("in if3")
+                              has_start_conversation = True
+                          if 'Condition' in statement and statement['Condition']['ArnEquals']['AWS:SourceArn']==connect_instance_arn:
+                              print("in if4")
+                              if has_recognize_text and has_start_conversation:
+                                  print("in if5")
+                                  return True
+                  
+                  return False
+              
+              except lex_client.exceptions.ResourceNotFoundException:
+                  print(f"Amazon Lex bot not found for alias ARN '{lex_bot_alias_arn}'.")
+                  return False
+              
+              except Exception as e:
+                  print(f"Error checking Amazon Lex bot permissions: {e}")
+                  return False
+
+          def put_config_evaluation(config_client, non_compliant_bots_list, compliance_status,event,connect_instance_arn):
+              """
+              Puts the evaluation result to AWS Config.
+              
+              Args:
+                  config_client (boto3.client): The Config client.
+                  lex_bot_alias_arn (str): The ARN of the Amazon Lex bot alias.
+                  has_necessary_permissions (bool): Indicates if the Lex bot has the necessary permissions.
+              """
+              invoking_event = json.loads(event['invokingEvent'])
+              annotation=getAnnotation(compliance_status,non_compliant_bots_list)
+              config_client.put_evaluations(
+                  Evaluations=[
+                      {
+                          'ComplianceResourceType': 'AWS::Connect::Instance',
+                          'ComplianceResourceId': connect_instance_arn,
+                          'ComplianceType': 'COMPLIANT' if compliance_status else 'NON_COMPLIANT',
+                          'Annotation': annotation,
+                          'OrderingTimestamp': invoking_event['notificationCreationTime']
+                      }
+                  ],
+                  ResultToken=event['resultToken']
+              )
+
+          def getAnnotation(compliance_status,non_compliant_bots_list):
+              if not compliance_status:
+                  return "All bots associated with the Connect instance have the required permissions."
+              else:
+                  return "The following bots do not have the required permissions:"+str(non_compliant_bots_list)
+
+      Timeout: 400
+
+  CheckLexPolicyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LexV2LambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack
+  LexV2ResourcePolicyConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - LexV2LambdaExecutionRole
+      - LexV2LambdaFunction
+    Properties:
+      ConformancePackName: amazon-connect-lex-v2-permissions-checker
+      TemplateBody: !Sub
+        - |
+          Resources:
+            LexV2ConfigRule:
+                Type: AWS::Config::ConfigRule
+                Properties:
+                  ConfigRuleName: amazon-connect-lex-v2-resource-policy
+                  Description: Lex bot resource policy
+                  Source:
+                    Owner: CUSTOM_LAMBDA
+                    SourceDetails:
+                      - EventSource: aws.config
+                        MaximumExecutionFrequency: One_Hour
+                        MessageType: ScheduledNotification
+                    SourceIdentifier: ${Function}
+                  Scope:
+                    ComplianceResourceTypes:
+                      - AWS::Connect::LexBot
+        - { Function: !GetAtt 'LexV2LambdaFunction.Arn' }

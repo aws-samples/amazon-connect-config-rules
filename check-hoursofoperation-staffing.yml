@@ -1,0 +1,232 @@
+# Amazon Connect Config Rules - Check Hour of Operations and Staffing
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for the Lambda Function
+  CheckHoursAndStaffingExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Lambda Function
+  CheckHoursAndStaffingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CheckHoursAndStaffing
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckHoursAndStaffingExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import re
+          import os
+          import urllib.parse
+
+          connect_client = boto3.client('connect')
+
+          def list_connect_instances():
+              # Returns a list of Connect instance ARNs in this region.
+              response = connect_client.list_instances()
+              instances = response.get('InstanceSummaryList')
+
+              # Continue checking for instances, as long as there is a next token
+              while 'NextToken' in response:
+                  response = connect_client.list_instances(NextToken=response['NextToken'])
+                  instances.extend(response.get('InstanceSummaryList'))
+
+              return instances
+
+          def list_contact_flows(instance_id):
+              # Define the types of contact flows we want to retrieve
+              flow_types = ['CONTACT_FLOW', 'CUSTOMER_QUEUE', 'AGENT_TRANSFER', 'QUEUE_TRANSFER']
+              
+
+              # Returns a list of specific types of contact flows in this Connect instance
+              response = connect_client.list_contact_flows(
+                  InstanceId=instance_id,
+                  ContactFlowTypes=flow_types
+              )
+              flows = response.get('ContactFlowSummaryList', [])
+
+              # Continue checking for contact flows, as long as there is a next token
+              while 'NextToken' in response:
+                  response = connect_client.list_contact_flows(
+                      InstanceId=instance_id,
+                      ContactFlowTypes=flow_types,
+                      NextToken=response['NextToken']
+                  )
+                  flows.extend(response.get('ContactFlowSummaryList', []))
+
+              return flows
+
+          def evaluate_compliance(connect_instance):
+              flow_list = list_contact_flows(connect_instance)
+              compliant_flows = []
+              non_compliant_flows = []
+              
+              for flow in flow_list:
+                  try:
+                      describe_flow = connect_client.describe_contact_flow(
+                          InstanceId=connect_instance,
+                          ContactFlowId=flow["Id"]
+                          #ContactFlowId="6566571f-0c59-4a14-ac37-4d2e04642a6b"
+                      )
+                      
+                      # Parse the contact flow content
+                      flow_content = json.loads(describe_flow['ContactFlow']['Content'])
+
+                      
+                      # Check for the presence and order of required blocks
+                      has_check_hours = False
+                      has_check_staffing = False
+                      has_transfer_to_queue = False
+                      for action in flow_content.get('Actions', []):
+                          if action.get('Type') == 'CheckHoursOfOperation':
+                              has_check_hours = True
+                            
+                          elif action.get('Type') == 'CheckMetricData':
+                              has_check_staffing = True
+                              
+                          elif action.get('Type') == 'TransferContactToQueue':
+                              has_transfer_to_queue = True
+
+                      
+                      if  has_check_hours and has_check_staffing and has_transfer_to_queue:
+                          compliant_flows.append(flow['Name'])
+                      elif has_transfer_to_queue and not (has_check_hours and has_check_staffing):
+                          non_compliant_flows.append(flow['Name'])            
+                  except Exception as e:
+                      print(f"Error analyzing flow '{flow['Name']}': {str(e)}")
+              
+              return {
+                  'CompliantFlows': compliant_flows,
+                  'NonCompliantFlows': non_compliant_flows
+              }
+
+          def evaluate_all_connect_instances(event,url):
+              instances = list_connect_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              evaluations = []
+              for instance in instances:
+                  result = evaluate_compliance(instance["Id"])
+                  if result['CompliantFlows']:
+                      compliant_evaluation = {
+                          'Annotation': f'Check compliant flows at-'+str(url),
+                          'ComplianceResourceType': 'AWS::Connect::Instance',
+                          'ComplianceResourceId': instance['Id'],
+                          'ComplianceType': 'COMPLIANT',
+                          'OrderingTimestamp': invoking_event['notificationCreationTime']
+                      }
+                      evaluations.append(compliant_evaluation)
+                  if result['NonCompliantFlows']:
+                      non_compliant_evaluation = {
+                          'Annotation': f'Check Non Compliant flows at-'+str(url),
+                          'ComplianceResourceType': 'AWS::Connect::Instance',
+                          'ComplianceResourceId': instance['Id'],
+                          'ComplianceType': 'NON_COMPLIANT',
+                          'OrderingTimestamp': invoking_event['notificationCreationTime']
+                      }
+                      evaluations.append(non_compliant_evaluation)
+                  print("For Instance:"+str(instance['Id']) + "\nComplaint Flows are - "+ str(result['CompliantFlows'])+" "+"\nNon CompliantFlows are "+str(result['NonCompliantFlows']))
+
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+              )
+              response="success"
+              return response
+
+          def lambda_handler(event, context): 
+
+              # Get the necessary information from the context and environment
+              function_name = context.function_name
+              log_group_name = context.log_group_name
+              log_stream_name = context.log_stream_name
+              region = os.environ['AWS_REGION']
+
+              # Construct the CloudWatch Logs URL
+              encoded_log_group_name = urllib.parse.quote(log_group_name, safe='')
+              encoded_log_stream_name = urllib.parse.quote(log_stream_name, safe='')
+              
+              cloudwatch_url = (
+                  f"https://{region}.console.aws.amazon.com/cloudwatch/home?"
+                  f"region={region}#logsV2:log-groups/log-group/{encoded_log_group_name}/"
+                  f"log-events/{encoded_log_stream_name}"
+              )
+              
+              response = evaluate_all_connect_instances(event,cloudwatch_url)
+              return response
+
+      Timeout: 900
+
+  CheckHoursAndStaffingPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckHoursAndStaffingFunction.Arn
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack
+  CheckHoursAndStaffingConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckHoursAndStaffingExecutionRole
+      - CheckHoursAndStaffingFunction
+    Properties:
+      ConformancePackName: amazon-connect-check-hours-of-operation-and-staffing
+      TemplateBody: !Sub
+        - |
+          Resources:
+             CheckHoursAndStaffingConfigRule:
+                Type: AWS::Config::ConfigRule
+                Properties:
+                  ConfigRuleName: amazon-connect-checkStaffing-checkHoursOfOperation
+                  Description: To check staffing and hours of operation before transferring a call to agent and putting that call in a queue.
+                  Source:
+                    Owner: CUSTOM_LAMBDA
+                    SourceDetails:
+                      - EventSource: aws.config
+                        MaximumExecutionFrequency: One_Hour
+                        MessageType: ScheduledNotification
+                    SourceIdentifier: ${Function}
+                  Scope:
+                    ComplianceResourceTypes:
+                      - AWS::Connect::Instance
+        - { Function: !GetAtt 'CheckHoursAndStaffingFunction.Arn' }
