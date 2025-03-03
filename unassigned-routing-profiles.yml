@@ -1,0 +1,166 @@
+# Amazon Connect Config Rules - Unassigned Routing Profiles
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckUnassignedRoutingProfilesLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Check if there are Routing Profiles which are not assigned to any users
+  CheckUnassignedRoutingProfilesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckUnassignedRoutingProfilesLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          connect_client = boto3.client('connect')
+
+          def evaluate_compliance(connect_instance):
+
+            #Get all the Routing Profiles
+            routing_profiles_list = connect_client.list_routing_profiles(
+              InstanceId=connect_instance
+            )
+
+            if not routing_profiles_list["RoutingProfileSummaryList"]:
+              return "NOT_APPLICABLE"
+
+            #Extract only the list of Routing Profile Ids
+            x = {}
+            routing_profiles_id_list = [x["Id"] for x in routing_profiles_list["RoutingProfileSummaryList"]]
+
+            #Get all Users
+            users_list = connect_client.list_users(
+              InstanceId=connect_instance
+            )
+
+            user_routing_profile_id_list = []
+
+            for user in users_list["UserSummaryList"]:
+
+              user_details = connect_client.describe_user(
+                InstanceId=connect_instance,
+                UserId=user["Id"]
+              )
+
+              user_routing_profile_id_list.append(user_details["User"]["RoutingProfileId"])
+
+            unassigned_routing_profiles_list = list(set(routing_profiles_id_list) - set(user_routing_profile_id_list))
+
+            if(unassigned_routing_profiles_list):
+              print("These Routing Profile IDs in InstanceID "+ connect_instance + " is not assigned to any Users:")
+              print(", ".join(unassigned_routing_profiles_list))
+              return "NON_COMPLIANT"
+            else:
+              return "COMPLIANT"
+
+
+          def evaluate_all_connect_instances(event):
+            instances = connect_client.list_instances()
+            invoking_event = json.loads(event['invokingEvent'])
+
+            evaluations = []
+            print("Found Instances:", instances)
+            for instance in instances['InstanceSummaryList']:
+              compliance_status = evaluate_compliance(instance["Id"])
+              evaluation = {
+                'Annotation': f'No Unassigned Routing Profiles' if compliance_status == "COMPLIANT" else (f'There are Unassigned Routing Profiles' if compliance_status == "NON_COMPLIANT" else f'There are no Routing Profiles in the instance'),
+                'ComplianceResourceType': 'AWS::Connect::Instance',
+                'ComplianceResourceId': instance['Id'],
+                'ComplianceType': compliance_status,
+                'OrderingTimestamp': invoking_event['notificationCreationTime']
+              }
+              print ("Inserting evaluation:", evaluation)
+              evaluations.append(evaluation)
+
+            config_client = boto3.client('config')
+            response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+            )
+
+            return response
+
+          def lambda_handler(event, context):
+            print("Received Config Event:", event)
+
+            response = evaluate_all_connect_instances(event)
+            return response
+
+      Timeout: 60
+
+  CheckUnassignedRoutingProfilesLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckUnassignedRoutingProfilesLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckUnassignedRoutingProfilesConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckUnassignedRoutingProfilesLambdaExecutionRole
+      - CheckUnassignedRoutingProfilesLambdaFunction
+      - CheckUnassignedRoutingProfilesLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-unassigned-routing-profiles-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check UNASSIGNED_ROUTING_PROFILES
+            CheckUnassignedRoutingProfilesConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-unassigned-routing-profiles-rule
+                Description: Check if there are Routing Profiles not assigned to any users
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckUnassignedRoutingProfilesLambdaFunction.Arn' }

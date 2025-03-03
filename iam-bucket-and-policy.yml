@@ -1,0 +1,185 @@
+# Amazon Connect Config Rules - IAM Bucket and Polcies
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckIAMBucketPolicyLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/IAMReadOnlyAccess
+
+  # Check various Amazon Connect instance storage config settings
+  CheckIAMBucketPolicyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckIAMBucketPolicyLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def check_connect_s3_bucket_policy_compliance(config_client, connect_client, s3_client):
+            """
+            Checks the compliance of IAM bucket policies for Amazon Connect S3 buckets.
+            
+            Args:
+                config_client (boto3.client): AWS Config client
+                connect_client (boto3.client): Amazon Connect client
+                s3_client (boto3.client): Amazon S3 client
+            
+            Returns:
+                list: Compliance evaluation results
+            """
+            evaluations = []
+            
+            # List all Amazon Connect instances
+            instances = connect_client.list_instances()
+            
+            for instance in instances['InstanceSummaryList']:
+                instance_id = instance['Id']
+                
+                # Get the S3 bucket used by the Amazon Connect instance
+                try:
+                    response = connect_client.list_instance_storage_configs(InstanceId=instance_id, ResourceType='CHAT_TRANSCRIPTS'or'CALL_RECORDINGS'or'SCHEDULED_REPORTS'or'MEDIA_STREAMS'or'CONTACT_TRACE_RECORDS'or'AGENT_EVENTS'or'REAL_TIME_CONTACT_ANALYSIS_SEGMENTS'or'ATTACHMENTS'or'CONTACT_EVALUATIONS'or'SCREEN_RECORDINGS'or'REAL_TIME_CONTACT_ANALYSIS_CHAT_SEGMENTS'or'REAL_TIME_CONTACT_ANALYSIS_VOICE_SEGMENTS')
+                    bucket_name = response['StorageConfigs'][0]['S3Config']['BucketName']
+                except ClientError as e:
+                    print(f"Error getting S3 bucket for instance {instance_id}: {e}")
+                    continue
+                
+                # Check IAM bucket policy compliance
+                try:
+                    response = s3_client.get_bucket_policy(Bucket=bucket_name)
+                    bucket_policy = response['Policy']
+                  # Check if the bucket policy allows more than the necessary permissions for Amazon Connect
+                    if 'allow' in bucket_policy and '*' in bucket_policy:
+                        if 's3:GetObject' in bucket_policy and 's3:GetObjectAcl' in bucket_policy and 's3:PutObject' in bucket_policy and 's3:PutObjectAcl' in bucket_policy and 's3:DeleteObject' in bucket_policy and 's3:GetBucketLocation' in bucket_policy and 's3:GetBucketAcl' in bucket_policy:
+                          compliance_type = 'NON_COMPLIANT'
+                    else:
+                      compliance_type = 'COMPLIANT'
+                except ClientError as e:
+                  # This mean that the bucket policy doesn't exist.
+                    compliance_type = 'COMPLIANT'
+                    
+                    # Check if Amazon Connect instance has a service role.
+                if compliance_type == 'COMPLIANT':
+                    response = connect_client.describe_instance(InstanceId=instance_id)
+                    service_role = response['Instance']['ServiceRole']
+                    if service_role:
+                      compliance_type = 'COMPLIANT'
+                    else:
+                      print(f"Error getting ServiceRole of the following Amazon Connect instance: {instance_id}, {service_role}")
+                      compliance_type = 'NON_COMPLIANT'
+                      
+                if compliance_type == 'COMPLIANT':
+                    try:
+                        response = s3_client.get_bucket_policy_status(Bucket=bucket_name)
+                        policy_status = response['PolicyStatus']['IsPublic']
+                        if policy_status == 'False':
+                          compliance_type = 'COMPLIANT'
+                        else:
+                          print(f"S3 bucket is non-compliant, the following S3 bucket is public: {bucket_name}")
+                          compliance_type = 'NON_COMPLIANT'
+                    except ClientError as e:
+                      # The bucket policy does not exist.
+                      compliance_type = 'COMPLIANT'
+                
+                evaluation = {
+                    'Annotation': f'Amazon Connect IAM bucket policy best practices for instance {instance_id} is {"compliant" if compliance_type == "COMPLIANT" else "non-compliant"}',
+                    'ComplianceResourceType': 'AWS::Connect::Instance',
+                    'ComplianceResourceId': instance_id,
+                    'ComplianceType': compliance_type,
+                    'OrderingTimestamp': '2023-04-01T00:00:00'
+                }
+                evaluations.append(evaluation)
+            
+            return evaluations
+
+          def lambda_handler(event, context):
+            config_client = boto3.client('config')
+            connect_client = boto3.client('connect')
+            s3_client = boto3.client('s3')
+            
+            evaluations = check_connect_s3_bucket_policy_compliance(config_client, connect_client, s3_client)
+            
+            response = config_client.put_evaluations(
+                Evaluations=evaluations,
+                ResultToken=event['resultToken']
+            )
+            
+            return response
+
+      Timeout: 10
+
+  CheckIAMBucketPolicyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckIAMBucketPolicyFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckIAMBucketPolicyConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckIAMBucketPolicyLambdaExecutionRole
+      - CheckIAMBucketPolicyFunction
+      - CheckIAMBucketPolicyLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-iam-bucket-and-policy-best-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check IAM_BUCKET_AND_POLICY
+            CheckIAMBucketPolicyConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-iam-bucket-and-policy
+                Description: Check IAM bucket and policy within Amazon Connect instances in an account
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckIAMBucketPolicyFunction.Arn' }

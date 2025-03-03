@@ -1,0 +1,162 @@
+# Amazon Connect Config Rules - Check Encryption on Store Customer Input
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckStoreCustomerInputEncryptionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Check Amazon Connect Interruption time of Loop Prompts is less than 20
+  CheckStoreCustomerInputEncryptionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckStoreCustomerInputEncryptionLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          connect_client = boto3.client('connect')
+
+          def evaluate_compliance(connect_instance):
+
+            #Get All Contact Flows of various types which can have a StoreCustomerInput block
+
+            flow_list = connect_client.list_contact_flows(
+              InstanceId=connect_instance,
+              ContactFlowTypes=['CONTACT_FLOW','CUSTOMER_QUEUE','AGENT_TRANSFER','QUEUE_TRANSFER']
+            )
+
+            if not flow_list["ContactFlowSummaryList"]:
+              return "NOT_APPLICABLE"
+            else:
+              non_compaint_flow =[]
+
+              for flow in flow_list["ContactFlowSummaryList"]:
+                describe_flow = connect_client.describe_contact_flow(
+                  InstanceId=connect_instance,
+                  ContactFlowId=flow["Id"]
+                )
+            
+                #Extract the Flow Metadata and convert it into JSON
+            
+                flow_content = json.loads(describe_flow["ContactFlow"]["Content"])
+                
+                for Action in flow_content["Actions"]:
+                  if("Parameters" in Action and "StoreInput" in Action["Parameters"] and Action["Parameters"]["StoreInput"] == "True" and "CustomValidation" in Action["Parameters"]["InputValidation"] and "InputEncryption" not in Action["Parameters"]):
+                    print(describe_flow["ContactFlow"]["Name"])
+                    non_compaint_flow.append(describe_flow["ContactFlow"]["Name"])
+            
+              if(non_compaint_flow):
+                print("These flow(s) in InstanceID "+ connect_instance + " does not have Encryption enabled for StoreCustomerInput block:" + str(non_compaint_flow))
+                return "NON_COMPLIANT"
+              else:
+                return "COMPLIANT"
+
+          def evaluate_all_connect_instances(event):
+            instances = connect_client.list_instances()
+            invoking_event = json.loads(event['invokingEvent'])
+
+            evaluations = []
+            print("Found Instances:", instances)
+            for instance in instances['InstanceSummaryList']:
+              compliance_status = evaluate_compliance(instance["Id"])
+              evaluation = {
+                'Annotation': f'StoreCustomerInput block have encryption enabled' if compliance_status == "COMPLIANT" else f'StoreCustomerInput block does not have encryption enabled',
+                'ComplianceResourceType': 'AWS::Connect::Instance',
+                'ComplianceResourceId': instance['Id'],
+                'ComplianceType': compliance_status,
+                'OrderingTimestamp': invoking_event['notificationCreationTime']
+              }
+              print ("Inserting evaluation:", evaluation)
+              evaluations.append(evaluation)
+
+            config_client = boto3.client('config')
+            response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+            )
+
+            return evaluations
+
+
+          def lambda_handler(event, context):
+            print("Received Config Event:", event)
+
+            response = evaluate_all_connect_instances(event)
+            return response
+
+      Timeout: 60
+
+  CheckStoreCustomerInputEncryptionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckStoreCustomerInputEncryptionLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckStoreCustomerInputEncryptionConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckStoreCustomerInputEncryptionLambdaExecutionRole
+      - CheckStoreCustomerInputEncryptionLambdaFunction
+      - CheckStoreCustomerInputEncryptionLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-store-customer-input-encryption-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check STORE_CUSTOMER_INPUT_ENCRYPTION
+            CheckStoreCustomerInputEncryptionConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-store-customer-input-encryption-rule
+                Description: Check if Store Customer Input Blocks have encryption enabled for Custom Inputs
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckStoreCustomerInputEncryptionLambdaFunction.Arn' }

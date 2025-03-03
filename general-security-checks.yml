@@ -1,15 +1,14 @@
-# Amazon Connect Config Rules
-# By Sam Frederick <samfred@amazon.com>
+# Amazon Connect Config Rules - General Security Checks
 #
 # This is a sample set of AWS Config rules that validate various
 # configuration settings on Amazon Connect instances. These rules
 # are not designed to be a definitive answer to security or compliance
 # requirements, rather an example of how AWS API's can be used to automate
 # regular checks of configuration.
-# 
+#
 # LICENSE: MIT No Attribution
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# 
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy of
 # this software and associated documentation files (the "Software"), to deal in
 # the Software without restriction, including without limitation the rights to
@@ -25,7 +24,7 @@
 
 AWSTemplateFormatVersion: '2010-09-09'
 Description: AWS Config rules to check configuration settings on Amazon Connect instances
-Resources: 
+Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -126,7 +125,7 @@ Resources:
               return response
 
       Timeout: 10
-  
+
   CheckInstanceStorageConfigLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -142,7 +141,7 @@ Resources:
       - CheckInstanceStorageConfigLambdaPermission
     Properties:
       ConformancePackName: amazon-connect-operational-best-practices
-      TemplateBody: !Sub 
+      TemplateBody: !Sub
         - |
           Resources:
             # Check CALL_RECORDINGS
@@ -306,4 +305,3 @@ Resources:
                   ComplianceResourceTypes:
                     - AWS::Connect::Instance
         - { Function: !GetAtt 'CheckInstanceStorageConfigLambdaFunction.Arn' }
-              

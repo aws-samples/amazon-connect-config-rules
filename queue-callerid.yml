@@ -1,0 +1,201 @@
+# Amazon Connect Config Rules - Queue Caller IDs
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckQueueCallerIdLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Check various Amazon Connect instance storage config settings
+  CheckQueueCallerIdLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckQueueCallerIdLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def evaluate_compliance(connect_instance, queue_type):
+            connect_client = boto3.client('connect')
+
+            if(queue_type == "ALL"):
+              #The Queue list will have all the queues in the Amazon Connect instance
+              queues_list = connect_client.list_queues(
+                InstanceId=connect_instance,
+                QueueTypes=['STANDARD']
+              )
+
+              if not queues_list["QueueSummaryList"]:
+                return "NOT_APPLICABLE"
+              else:
+                for queue in queues_list["QueueSummaryList"]:
+                  queue_detail = connect_client.describe_queue(
+                    InstanceId=connect_instance,
+                    QueueId=queue["Id"]
+                  )
+                
+                  if ("OutboundCallerConfig" not in queue_detail["Queue"] or "OutboundCallerIdNumberId" not in queue_detail["Queue"]["OutboundCallerConfig"]):
+                    print("This Queue in connect instanceID " + connect_instance + "does not have Outbound CallerIDNumber:" + queue_detail["Queue"]["Name"])
+                    return "NON_COMPLIANT"
+                return "COMPLIANT"
+
+            else:
+              #The Queue list will have only the queues which have been set as an Outbound Queue in all the Routing Profile of the instance
+
+              queues_list =[]
+
+              routing_profile_list = connect_client.list_routing_profiles(
+                InstanceId=connect_instance
+              )
+
+              if not routing_profile_list["RoutingProfileSummaryList"]:
+                return "NOT_APPLICABLE"
+
+              for routing_profile in routing_profile_list["RoutingProfileSummaryList"]:
+                routing_profile_detail = connect_client.describe_routing_profile(
+                  InstanceId=connect_instance,
+                  RoutingProfileId=routing_profile["Id"]
+                )
+
+                queues_list.append(routing_profile_detail["RoutingProfile"]["DefaultOutboundQueueId"])
+
+              for queue in queues_list:
+                queue_detail = connect_client.describe_queue(
+                  InstanceId=connect_instance,
+                  QueueId=queue
+                )
+            
+                if ("OutboundCallerConfig" not in queue_detail["Queue"] or "OutboundCallerIdNumberId" not in queue_detail["Queue"]["OutboundCallerConfig"]):
+                  print("This Queue in connect instanceID " + connect_instance + "does not have Outbound CallerIDNumber:" + queue_detail["Queue"]["Name"])
+                  return "NON_COMPLIANT"    
+
+              return "COMPLIANT"
+                  
+              
+          def evaluate_all_connect_instances(event,queue_type):
+              connect_client = boto3.client('connect')
+              instances = connect_client.list_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              evaluations = []
+              print("Found Instances:", instances)
+              for instance in instances['InstanceSummaryList']:
+                  compliance_status = evaluate_compliance(instance["Id"],queue_type)
+                  evaluation = {
+                      'Annotation': f'Queue Outbound CallerID number exists' if compliance_status == "COMPLIANT" else f'Queue Outbound CallerID number is missing',
+                      'ComplianceResourceType': 'AWS::Connect::Instance',
+                      'ComplianceResourceId': instance['Id'],
+                      'ComplianceType': compliance_status,
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                  }
+                  print ("Inserting evaluation:", evaluation)
+                  evaluations.append(evaluation)
+                  
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+                  Evaluations=evaluations,
+                  ResultToken=event['resultToken']
+              )
+                  
+              return response
+                  
+          def lambda_handler(event, context):
+              print("Received Config Event:", event)
+              queue_type = json.loads(event['ruleParameters'])['QueueType']
+              response = evaluate_all_connect_instances(event,queue_type)
+              return response
+
+      Timeout: 15
+
+  CheckQueueCallerIdLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckQueueCallerIdLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckQueueCallerIdConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckQueueCallerIdLambdaExecutionRole
+      - CheckQueueCallerIdLambdaFunction
+      - CheckQueueCallerIdLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-queue-callerid-best-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check ALL QUEUES CALLER ID
+            CheckAllQueueCallerIDConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-all-queue-caller-id-number
+                Description: Check whether all the queues in Amazon Connect instances has callerid number set.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"QueueType": "ALL"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check ROUTING PROFILE QUEUES CALLER ID
+            CheckRoutingProfileQueueCallerIDConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-routing-profile-queue-caller-id-number
+                Description: Check whether only the queues which are set as Outbound Queue in Routing Profile has callerid number set.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"QueueType": "ROUTING_PROFILE_QUEUE"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckQueueCallerIdLambdaFunction.Arn' }

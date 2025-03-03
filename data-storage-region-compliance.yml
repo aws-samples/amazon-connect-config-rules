@@ -1,0 +1,245 @@
+# Amazon Connect Config Rules - Data Storage Region Requirements
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckDataStorageRegionComplianceLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  # Check Amazon Connect Interruption time of Loop Prompts is less than 20
+  CheckDataStorageRegionComplianceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckDataStorageRegionComplianceLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          connect_client = boto3.client('connect')
+
+          def evaluate_compliance(connect_instance, instance_region, storage_config_type):
+
+            client = boto3.client('s3')
+
+            storage_configs = connect_client.list_instance_storage_configs(
+              InstanceId=connect_instance,
+              ResourceType=storage_config_type
+            )
+
+            print("Found storage configs for", connect_instance, ":", storage_configs)
+
+            for storage_config in storage_configs['StorageConfigs']:
+            
+              s3_bucket_location = client.get_bucket_location(
+                Bucket=storage_config["S3Config"]["BucketName"]
+              )
+
+              if((s3_bucket_location["LocationConstraint"] is None and instance_region == "us-east-1") or s3_bucket_location["LocationConstraint"] == instance_region):
+                return "COMPLIANT"
+              else:
+                print(f'The Connect instance is in {instance_region} while the storage type {storage_config_type} region is us-east-1' if s3_bucket_location["LocationConstraint"] is None else f'The Connect instance is in {instance_region} while the storage type {storage_config_type} region is { s3_bucket_location["LocationConstraint"]}' )
+                return "NON_COMPLIANT"
+
+            print("Storage config not found for", storage_config_type, ", returning NOT_APPLICABLE")
+            return "NOT_APPLICABLE"
+            
+
+          def evaluate_all_connect_instances(event, storage_config_type):
+            instances = connect_client.list_instances()
+            invoking_event = json.loads(event['invokingEvent'])
+
+            evaluations = []
+            print("Found Instances:", instances)
+            for instance in instances['InstanceSummaryList']:
+              instance_region= os.environ['AWS_REGION']
+              compliance_status = evaluate_compliance(instance["Id"], instance_region, storage_config_type)
+              evaluation = {
+                  'Annotation': f'Storage config {storage_config_type} is in the same region as the instance {instance["Id"]}' if compliance_status == "COMPLIANT" else (f'Storage config {storage_config_type} is not in the same region as the instance {instance["Id"]}' if compliance_status == "NON_COMPLIANT" else f'Storage config {storage_config_type} is not enabled'),
+                  'ComplianceResourceType': 'AWS::Connect::Instance',
+                  'ComplianceResourceId': instance['Id'],
+                  'ComplianceType': compliance_status,
+                  'OrderingTimestamp': invoking_event['notificationCreationTime']
+              }
+              print ("Inserting evaluation:", evaluation)
+              evaluations.append(evaluation)
+
+            config_client = boto3.client('config')
+            response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+            )
+
+            return response
+
+
+          def lambda_handler(event, context):
+            print("Received Config Event:", event)
+
+            storage_config_type = json.loads(event['ruleParameters'])['InstanceStorageType']
+            print("Evaluating", storage_config_type)
+            response = evaluate_all_connect_instances(event, storage_config_type)
+            return response
+
+      Timeout: 60
+
+  CheckDataStorageRegionComplianceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckDataStorageRegionComplianceLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckDataStorageRegionComplianceConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckDataStorageRegionComplianceLambdaExecutionRole
+      - CheckDataStorageRegionComplianceLambdaFunction
+      - CheckDataStorageRegionComplianceLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-data-storage-region-compliance
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check CALL_RECORDINGS
+            CallRecordingsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-call-recording-data-storage-rule
+                Description: Check if S3 region for Data Storage location of call recording is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CALL_RECORDINGS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check CHAT_TRANSCRIPTS
+            ChatTranscriptsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-chat-transcripts-data-storage-rule
+                Description: Check if S3 region for Data Storage location of chat transcripts is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CHAT_TRANSCRIPTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check SCHEDULED_REPORTS
+            ScheduledReportsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-scheduled-reports-data-storage-rule
+                Description: Check if S3 region for Data Storage location of scheduled reports is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "SCHEDULED_REPORTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check ATTACHMENTS
+            AttachmentsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-attachments-data-storage-rule
+                Description: Check if S3 region for Data Storage location of attachments is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "ATTACHMENTS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check CONTACT_EVALUATIONS
+            ContactEvaluationsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-contact-evaluations-data-storage-rule
+                Description: Check if S3 region for Data Storage location of contact evaluations is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "CONTACT_EVALUATIONS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+            # Check SCREEN_RECORDINGS
+            ScreenRecordingsDataStorageConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-screen-recordings-data-storage-rule
+                Description: Check if S3 region for Data Storage location of screen recordings is same as amazon connect instance region
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                InputParameters: {"InstanceStorageType": "SCREEN_RECORDINGS"}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckDataStorageRegionComplianceLambdaFunction.Arn' }

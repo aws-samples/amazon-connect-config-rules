@@ -1,0 +1,270 @@
+# Amazon Connect Config Rules - Check Orphan Agent Quick Connects
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  # IAM Role for the Lambda Function
+  CheckOrphanQCExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Lambda Function
+  CheckOrphanQC:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CheckOrphanQC
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckOrphanQCExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import re
+          import os
+          import urllib.parse
+          from botocore.exceptions import ClientError
+          import time
+
+          # Intialize connect client
+          connect_client = boto3.client('connect')
+
+          # Add a rate limiter class
+          class RateLimiter:
+              def __init__(self, max_calls, period):
+                  self.max_calls = max_calls
+                  self.period = period
+                  self.calls = []
+
+              def wait(self):
+                  now = time.time()
+                  self.calls = [call for call in self.calls if now - call < self.period]
+                  if len(self.calls) >= self.max_calls:
+                      sleep_time = self.calls[0] + self.period - now
+                      if sleep_time > 0:
+                          time.sleep(sleep_time)
+                  self.calls.append(time.time())
+
+          # Create a rate limiter instance
+          rate_limiter = RateLimiter(max_calls=10, period=1)
+
+
+
+          def list_connect_instances():
+              # Returns a list of Connect instance ARNs in this region.
+              response = connect_client.list_instances()
+              instances = response.get('InstanceSummaryList')
+
+              # Continue checking for instances, as long as there is a next token
+              while 'NextToken' in response:
+                  response = connect_client.list_instances(NextToken=response['NextToken'])
+                  instances.extend(response.get('InstanceSummaryList'))
+
+              return instances
+
+          def list_agent_quick_connects(instance_id):
+              connect_client = boto3.client('connect')
+              try:
+                  rate_limiter.wait()  # Wait for rate limit
+                  response = connect_client.list_quick_connects(
+                      InstanceId=instance_id,
+                      QuickConnectTypes=['USER']
+                  )
+                  return response.get('QuickConnectSummaryList', [])
+              except Exception as e:
+                  print(f"Error in list_agent_quick_connects for instance {instance_id}: {str(e)}")
+                  return []
+
+          def describe_user(instance_id, user_id):
+              connect_client = boto3.client('connect')
+              try:
+                  rate_limiter.wait()  # Wait for rate limit
+                  response = connect_client.describe_user(
+                      InstanceId=instance_id,
+                      UserId=user_id
+                  )
+                  # If the call succeeds, the user exists
+                  return True
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      # If we get a ResourceNotFoundException, the user doesn't exist
+                      return False
+                  else:
+                      # For any other error, we'll re-raise the exception
+                      raise
+
+
+          def isAgentConfigured(instance_id, quick_connect_id):
+              rate_limiter.wait()  # Wait for rate limit
+              response = connect_client.describe_quick_connect(
+                  InstanceId=instance_id,
+                  QuickConnectId=quick_connect_id
+              )
+              agentID = response.get('QuickConnect', {}).get('QuickConnectConfig', {}).get('UserConfig', {}).get('UserId')
+              if (describe_user(instance_id, agentID)):
+                  return True
+              else:
+                  return False
+
+
+          def evaluate_compliance(connect_instance):
+              agent_qc_list = list_agent_quick_connects(connect_instance)
+              if agent_qc_list is None:
+                  print(f"No quick connects found for instance {connect_instance}")
+                  return {
+                      'CompliantUsers': [],
+                      'NonCompliantUsers': [],
+                      'Error': "No quick connects found"
+                  }
+              
+              compliant_users = []
+              non_compliant_users = []
+              for qc in agent_qc_list:
+                  qc_name = qc.get('Name', 'Unknown')
+                  qc_id = qc.get('Id', 'Unknown')
+                  try:
+                      if isAgentConfigured(connect_instance, qc_id):
+                          compliant_users.append(qc_name)
+                      else:
+                          non_compliant_users.append(qc_name)
+                  except Exception as e:
+                      print(f"Error checking agent configuration for quick connect {qc_name}: {str(e)}")
+                      non_compliant_users.append(qc_name)
+              
+              return {
+                  'CompliantUsers': compliant_users,
+                  'NonCompliantUsers': non_compliant_users
+              }
+
+          def evaluate_all_connect_instances(event,url):
+              instances = list_connect_instances()
+              invoking_event = json.loads(event['invokingEvent'])
+              
+              evaluations = []
+              for instance in instances:
+                  result = evaluate_compliance(instance["Id"])
+                  compliant_evaluation = {
+                      'Annotation': f'Check your compliant Users \n'+str(url),
+                      'ComplianceResourceType': 'AWS::Connect::Instance',
+                      'ComplianceResourceId': instance['Id'],
+                      'ComplianceType': f'COMPLIANT',
+                      'OrderingTimestamp': invoking_event['notificationCreationTime']
+                  }
+                  evaluations.append(compliant_evaluation)
+
+                      # Add non_compliant_evaluation only if NonCompliantUsers list is not empty
+                  if result.get('NonCompliantUsers'):
+                      non_compliant_evaluation = {
+                          'Annotation': f'Check your Non Compliant Users\n{url}',
+                          'ComplianceResourceType': 'AWS::Connect::Instance',
+                          'ComplianceResourceId': instance['Id'],
+                          'ComplianceType': 'NON_COMPLIANT',
+                          'OrderingTimestamp': invoking_event['notificationCreationTime']
+                      }
+                      evaluations.append(non_compliant_evaluation)
+                  print(f"For Instance: {instance['Id']}")
+                  print(f"Compliant Users are - {result.get('CompliantUsers', [])}")
+                  print(f"Non Compliant Users are {result.get('NonCompliantUsers', [])}")
+                
+                
+              print(evaluations)
+              config_client = boto3.client('config')
+              response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+              )
+              response="success"
+              return response
+
+          def lambda_handler(event, context): 
+              print(event)
+              # Get the necessary information from the context and environment
+              function_name = context.function_name
+              log_group_name = context.log_group_name
+              log_stream_name = context.log_stream_name
+              region = os.environ['AWS_REGION']
+
+
+              # Construct the CloudWatch Logs URL
+              encoded_log_group_name = urllib.parse.quote(log_group_name, safe='')
+              encoded_log_stream_name = urllib.parse.quote(log_stream_name, safe='')
+              
+              cloudwatch_url = (
+                  f"https://{region}.console.aws.amazon.com/cloudwatch/home?"
+                  f"region={region}#logsV2:log-groups/log-group/{encoded_log_group_name}/"
+                  f"log-events/{encoded_log_stream_name}"
+              )
+              
+              
+              response = evaluate_all_connect_instances(event,cloudwatch_url)
+
+              return response
+      Timeout: 900
+
+  CheckOrphanQCPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckOrphanQC.Arn
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack
+  CheckOrphanQCConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckOrphanQCExecutionRole
+      - CheckOrphanQC
+    Properties:
+      ConformancePackName: amazon-connect-check-orphan-agent-quick-connects
+      TemplateBody: !Sub
+        - |
+          Resources:
+             CheckOrphanQCgRule:
+                Type: AWS::Config::ConfigRule
+                Properties:
+                  ConfigRuleName: checkOrphanAgentQuickConnects
+                  Description: To check for any orphan agent quick connects
+                  Source:
+                    Owner: CUSTOM_LAMBDA
+                    SourceDetails:
+                      - EventSource: aws.config
+                        MaximumExecutionFrequency: One_Hour
+                        MessageType: ScheduledNotification
+                    SourceIdentifier: ${Function}
+                  Scope:
+                    ComplianceResourceTypes:
+                      - AWS::Connect::Instance
+        - { Function: !GetAtt 'CheckOrphanQC.Arn' }

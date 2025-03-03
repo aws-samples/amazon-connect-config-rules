@@ -1,0 +1,169 @@
+# Amazon Connect Config Rules - Unassigned Queues
+
+# This is a sample set of AWS Config rules that validate various
+# configuration settings on Amazon Connect instances. These rules
+# are not designed to be a definitive answer to security or compliance
+# requirements, rather an example of how AWS API's can be used to automate
+# regular checks of configuration.
+#
+# LICENSE: MIT No Attribution
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  CheckUnassignedQueuesLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonConnectReadOnlyAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+
+  # Check if there are Queues which are not assigned to any routing profiles
+  CheckUnassignedQueuesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CheckUnassignedQueuesLambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          connect_client = boto3.client('connect')
+
+          def evaluate_compliance(connect_instance):
+
+            #Get all the Queue
+            queues_list = connect_client.list_queues(
+              InstanceId=connect_instance,
+              QueueTypes=[
+                'STANDARD'
+              ]
+            )
+
+            if not queues_list["QueueSummaryList"]:
+              return "NOT_APPLICABLE"
+
+            #Extract only the list of Queue Names
+            queues_name_list = [x["Name"] for x in queues_list["QueueSummaryList"]]
+
+            #Get all Routing Profiles
+            routing_profiles_list = connect_client.list_routing_profiles(
+              InstanceId=connect_instance
+            )
+
+            routing_profiles_queues_name_list = []
+
+            for routing_profiles in routing_profiles_list["RoutingProfileSummaryList"]:
+              routing_profile_queues_list = connect_client.list_routing_profile_queues(
+                InstanceId=connect_instance,
+                RoutingProfileId=routing_profiles["Id"]
+              )
+
+              for routing_profile_queues in routing_profile_queues_list["RoutingProfileQueueConfigSummaryList"]:
+                if routing_profile_queues["QueueName"] not in routing_profiles_queues_name_list:
+                  routing_profiles_queues_name_list.append(routing_profile_queues["QueueName"])
+            
+            unassigned_queues_list = list(set(queues_name_list) - set(routing_profiles_queues_name_list))
+
+            if(unassigned_queues_list):
+              print("These queues in InstanceID "+ connect_instance + " is not assigned to any routing profiles:")
+              print(", ".join(unassigned_queues_list))
+              return "NON_COMPLIANT"
+            else:
+              return "COMPLIANT"
+
+
+          def evaluate_all_connect_instances(event):
+            instances = connect_client.list_instances()
+            invoking_event = json.loads(event['invokingEvent'])
+
+            evaluations = []
+            print("Found Instances:", instances)
+            for instance in instances['InstanceSummaryList']:
+              compliance_status = evaluate_compliance(instance["Id"])
+              evaluation = {
+                'Annotation': f'No Unassigned Queues' if compliance_status == "COMPLIANT" else (f'There are Unassigned Queues' if compliance_status == "NON_COMPLIANT" else f'There are no Queues in the instance'),
+                'ComplianceResourceType': 'AWS::Connect::Instance',
+                'ComplianceResourceId': instance['Id'],
+                'ComplianceType': compliance_status,
+                'OrderingTimestamp': invoking_event['notificationCreationTime']
+              }
+              print ("Inserting evaluation:", evaluation)
+              evaluations.append(evaluation)
+
+            config_client = boto3.client('config')
+            response = config_client.put_evaluations(
+              Evaluations=evaluations,
+              ResultToken=event['resultToken']
+            )
+
+            return response
+
+          def lambda_handler(event, context):
+            print("Received Config Event:", event)
+
+            response = evaluate_all_connect_instances(event)
+            return response
+
+      Timeout: 60
+
+  CheckUnassignedQueuesLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckUnassignedQueuesLambdaFunction.Arn
+      Principal: config.amazonaws.com
+
+  CheckUnassignedQueuesConfigConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn:
+      - CheckUnassignedQueuesLambdaExecutionRole
+      - CheckUnassignedQueuesLambdaFunction
+      - CheckUnassignedQueuesLambdaPermission
+    Properties:
+      ConformancePackName: amazon-connect-unassigned-queues-practices
+      TemplateBody: !Sub
+        - |
+          Resources:
+            # Check UNASSIGNED_QUEUES
+            CheckUnassignedQueuesConfigRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: amazon-connect-unassigned-queues-rule
+                Description: Check if there are Queues which are not assigned to any routing profiles
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MaximumExecutionFrequency: One_Hour
+                      MessageType: ScheduledNotification
+                  SourceIdentifier: ${Function}
+                Scope:
+                  ComplianceResourceTypes:
+                    - AWS::Connect::Instance
+
+        - { Function: !GetAtt 'CheckUnassignedQueuesLambdaFunction.Arn' }
