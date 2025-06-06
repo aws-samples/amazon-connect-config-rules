@@ -166,7 +166,7 @@ Resources:
 
   # Check Amazon Connect Log Group Retention setting
 
-  CheckHoursAndStaffingConformancePack:
+  CheckConnectLogGroupRetentionConformancePack:
     Type: AWS::Config::ConformancePack
     DependsOn:
       - CheckConnectLogGroupRetentionExecutionRole
